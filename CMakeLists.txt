@@ -15,7 +15,7 @@ configure_file(
 
 find_package(OpenMP REQUIRED)
 
-add_executable(ply2lcc
+add_executable(ply2lcc2
     src/main.cpp
     src/convert_app.cpp
     src/splat_buffer.cpp
@@ -31,23 +31,23 @@ add_executable(ply2lcc
     external/miniply/miniply.cpp
 )
 
-target_include_directories(ply2lcc PRIVATE
+target_include_directories(ply2lcc2 PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/external
     ${CMAKE_BINARY_DIR}
 )
 
-target_compile_options(ply2lcc PRIVATE
+target_compile_options(ply2lcc2 PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -O2>
     $<$<CXX_COMPILER_ID:MSVC>:/W3 /O2 /utf-8>
 )
 
 # Windows-specific: prevent min/max macros from conflicting with std::min/std::max
 if(MSVC)
-    target_compile_definitions(ply2lcc PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(ply2lcc2 PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
 endif()
 
-target_link_libraries(ply2lcc PRIVATE OpenMP::OpenMP_CXX)
+target_link_libraries(ply2lcc2 PRIVATE OpenMP::OpenMP_CXX)
 
 # Options
 option(BUILD_TESTS "Build unit tests" ON)

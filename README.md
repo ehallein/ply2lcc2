@@ -1,4 +1,4 @@
-# ply2lcc
+# ply2lcc2
 
 A high-performance converter for 3D Gaussian Splatting (3DGS) PLY files to LCC and LCC2 packages.
 
@@ -28,14 +28,14 @@ package contains `meta.lcc2`, `LCC2-NOTICE.md`, and its PLY or SPZ payloads
 under `data/3dgs/`:
 
 ```bash
-./ply2lcc -i input.ply -o output_lcc2 --format lcc2
+./ply2lcc2 -i input.ply -o output_lcc2 --format lcc2
 ```
 
 To store an existing SPZ v4 payload while using its matching PLY for spatial
 metadata, add one `--lcc2-payload` per LOD:
 
 ```bash
-./ply2lcc -i garden.ply -o garden_lcc2 --format lcc2 \
+./ply2lcc2 -i garden.ply -o garden_lcc2 --format lcc2 \
   --lcc2-payload garden.spz
 ```
 
@@ -55,14 +55,14 @@ npm install -g @playcanvas/splat-transform
 Then generate a deterministic hierarchy from a PLY:
 
 ```bash
-./ply2lcc -i garden.ply -o garden_lcc2 --format lcc2 \
+./ply2lcc2 -i garden.ply -o garden_lcc2 --format lcc2 \
   --generate-lod --lod-levels 5 --lod-reduction 4 --lod-method cluster
 ```
 
 If `splat-transform` is not on `PATH`, pass its executable explicitly:
 
 ```bash
-./ply2lcc -i garden.ply -o garden_lcc2 --format lcc2 \
+./ply2lcc2 -i garden.ply -o garden_lcc2 --format lcc2 \
   --generate-lod --splat-transform /path/to/splat-transform
 ```
 
@@ -119,19 +119,19 @@ cmake .. -DBUILD_GUI=ON
 make -j$(nproc)
 ```
 
-This builds both the CLI (`ply2lcc`) and GUI (`ply2lcc-gui`) executables.
+This builds both the CLI (`ply2lcc2`) and GUI (`ply2lcc-gui`) executables.
 
 ## Usage
 
 ```bash
 # Single PLY file (auto-detects point_cloud_1.ply, point_cloud_2.ply, etc. in same dir)
-./ply2lcc -i /path/to/point_cloud.ply -o /path/to/output_dir
+./ply2lcc2 -i /path/to/point_cloud.ply -o /path/to/output_dir
 
 # Custom cell size
-./ply2lcc -i input.ply -o output --cell-size 50,50
+./ply2lcc2 -i input.ply -o output --cell-size 50,50
 
 # Single LOD mode (no LOD hierarchy)
-./ply2lcc -i input.ply -o output --single-lod
+./ply2lcc2 -i input.ply -o output --single-lod
 ```
 
 ### Options

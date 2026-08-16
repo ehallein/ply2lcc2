@@ -43,7 +43,7 @@ echo "Build directory: $BUILD_PATH"
 echo "Output directory: $OUTPUT_PATH"
 
 # Check build outputs exist
-CLI_EXE="$BUILD_PATH/ply2lcc"
+CLI_EXE="$BUILD_PATH/ply2lcc2"
 GUI_EXE="$BUILD_PATH/gui/ply2lcc-gui"
 
 if [[ ! -f "$CLI_EXE" ]]; then
@@ -206,8 +206,8 @@ done
 # Patch RPATH so executables find libraries without wrapper scripts
 echo "Patching RPATH with patchelf..."
 if command -v patchelf &> /dev/null; then
-    patchelf --set-rpath '$ORIGIN/../lib' "$OUTPUT_PATH/bin/ply2lcc"
-    echo "  Patched: ply2lcc"
+    patchelf --set-rpath '$ORIGIN/../lib' "$OUTPUT_PATH/bin/ply2lcc2"
+    echo "  Patched: ply2lcc2"
 
     if $HAS_GUI; then
         patchelf --set-rpath '$ORIGIN/../lib' "$OUTPUT_PATH/bin/ply2lcc-gui"
@@ -233,7 +233,7 @@ else
 fi
 
 # Create convenience symlinks at root level
-ln -sf bin/ply2lcc "$OUTPUT_PATH/ply2lcc"
+ln -sf bin/ply2lcc2 "$OUTPUT_PATH/ply2lcc2"
 if $HAS_GUI; then
     ln -sf bin/ply2lcc-gui "$OUTPUT_PATH/ply2lcc-gui"
 fi
@@ -244,7 +244,7 @@ ply2lcc - 3DGS PLY to LCC Converter
 ===================================
 
 Usage:
-  CLI: ./ply2lcc -i <input.ply> -o <output_dir> [options]
+  CLI: ./ply2lcc2 -i <input.ply> -o <output_dir> [options]
   GUI: ./ply2lcc-gui
 
 Requirements:

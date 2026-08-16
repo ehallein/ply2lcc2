@@ -26,7 +26,7 @@ mkdir -p "$APPDIR/usr/share/applications"
 mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
 # Copy executables
-cp "$BUILD_DIR/ply2lcc" "$APPDIR/usr/bin/"
+cp "$BUILD_DIR/ply2lcc2" "$APPDIR/usr/bin/"
 cp "$BUILD_DIR/gui/ply2lcc-gui" "$APPDIR/usr/bin/"
 
 # Create desktop file
@@ -107,7 +107,7 @@ ARCH=x86_64 "$TOOLS_DIR/appimagetool" "$APPDIR" "ply2lcc-x86_64.AppImage"
 # Create release folder
 mkdir -p "$PROJECT_DIR/release"
 mv "ply2lcc-x86_64.AppImage" "$PROJECT_DIR/release/"
-cp "$BUILD_DIR/ply2lcc" "$PROJECT_DIR/release/"
+cp "$BUILD_DIR/ply2lcc2" "$PROJECT_DIR/release/"
 
 # Cleanup
 rm -rf "$APPDIR"

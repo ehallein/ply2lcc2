@@ -20,7 +20,7 @@ Write-Host "Build directory: $BuildPath"
 Write-Host "Output directory: $OutputPath"
 
 # Check build outputs exist
-$CliExe = Join-Path $BuildPath "Release\ply2lcc.exe"
+$CliExe = Join-Path $BuildPath "Release\ply2lcc2.exe"
 $GuiExe = Join-Path $BuildPath "gui\Release\ply2lcc-gui.exe"
 
 if (-not (Test-Path $CliExe)) {
