@@ -208,6 +208,7 @@ struct ConvertConfig {
     bool single_lod = false;
     OutputFormat output_format = OutputFormat::Lcc;
     std::vector<std::filesystem::path> lcc2_payload_paths;
+    std::filesystem::path splat_transform_path = "splat-transform";
     LodSettings lod;
     bool include_env = true;
     std::filesystem::path env_path;

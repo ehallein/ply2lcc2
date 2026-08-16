@@ -107,6 +107,12 @@ if(BUILD_TESTS)
     add_executable(test_lcc2_writer tests/test_lcc2_writer.cpp)
     target_link_libraries(test_lcc2_writer ply2lcc_lib GTest::gtest_main)
 
+    add_executable(fake_splat_transform tests/fake_splat_transform.cpp)
+    target_compile_definitions(test_lcc2_writer PRIVATE
+        PLY2LCC_FAKE_SPLAT_TRANSFORM="$<TARGET_FILE:fake_splat_transform>"
+    )
+    add_dependencies(test_lcc2_writer fake_splat_transform)
+
     add_executable(test_lod_generator tests/test_lod_generator.cpp)
     target_link_libraries(test_lod_generator ply2lcc_lib GTest::gtest_main)
 

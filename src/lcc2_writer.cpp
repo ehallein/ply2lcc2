@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstdint>
 #include <iomanip>
+#include <functional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -215,7 +216,8 @@ void Lcc2Writer::write(const SpatialGrid& grid,
              << "\t\"lodSplats\": [";
     for (size_t i = 0; i < lod_counts.size(); ++i) {
         if (i != 0) metadata << ", ";
-        metadata << lod_counts[i];
+        const size_t lod = lod_errors.empty() ? i : lod_counts.size() - 1 - i;
+        metadata << lod_counts[lod];
     }
     metadata << "],\n"
              << "\t\"totalLevels\": " << lod_counts.size() << ",\n"
@@ -224,7 +226,7 @@ void Lcc2Writer::write(const SpatialGrid& grid,
         metadata << "\t\"lodErrors\": [";
         for (size_t i = 0; i < lod_errors.size(); ++i) {
             if (i != 0) metadata << ", ";
-            metadata << lod_errors[i];
+            metadata << lod_errors[lod_errors.size() - 1 - i];
         }
         metadata << "],\n";
     }
@@ -296,13 +298,12 @@ void Lcc2Writer::write(const SpatialGrid& grid,
                      << "\t\t\t\t\"id\": \"cell-" << cell_id << "\",\n"
                      << "\t\t\t\t\"boundingBox\": ";
             write_bbox(metadata, cell_bbox, 4);
-            metadata << ",\n\t\t\t\t\"childNum\": " << (present.empty() ? 0 : 1)
-                     << ",\n\t\t\t\t\"data\": null,\n\t\t\t\t\"child\": ";
             if (present.empty()) {
-                metadata << "{}\n";
+                metadata << ",\n\t\t\t\t\"childNum\": 0,\n"
+                         << "\t\t\t\t\"data\": null\n";
             } else {
-                metadata << "{\n";
-                for (size_t depth = 0; depth < present.size(); ++depth) {
+                std::function<void(size_t, int)> write_lod_fields;
+                write_lod_fields = [&](size_t depth, int indent) {
                     const size_t lod = present[depth];
                     const auto& indices = cell.splat_indices[lod];
                     for (size_t i = 1; i < indices.size(); ++i) {
@@ -310,25 +311,25 @@ void Lcc2Writer::write(const SpatialGrid& grid,
                             throw std::runtime_error("Generated LOD payload is not contiguous within spatial cell");
                         }
                     }
-                    const std::string pad(5 + depth, '\t');
-                    metadata << pad << "\"" << lod << "\": {\n"
-                             << pad << "\t\"id\": \"cell-" << cell_id << "-lod-" << lod << "\",\n"
-                             << pad << "\t\"boundingBox\": ";
-                    write_bbox(metadata, cell_bbox, 6 + static_cast<int>(depth));
-                    metadata << ",\n" << pad << "\t\"lodLevel\": " << lod
-                             << ",\n" << pad << "\t\"lodError\": " << lod_errors[lod]
-                             << ",\n" << pad << "\t\"childNum\": " << (depth + 1 < present.size() ? 1 : 0)
-                             << ",\n" << pad << "\t\"data\": {\"3dgs\": {\"name\": " << lod
+                    const std::string pad(static_cast<size_t>(indent), '\t');
+                    metadata << ",\n" << pad << "\"lodLevel\": " << (lod_files.size() - 1 - lod)
+                             << ",\n" << pad << "\"lodError\": " << lod_errors[lod]
+                             << ",\n" << pad << "\"childNum\": " << (depth + 1 < present.size() ? 1 : 0)
+                             << ",\n" << pad << "\"data\": {\"3dgs\": {\"name\": " << lod
                              << ", \"start\": " << indices.front() << ", \"count\": " << indices.size() << "}}";
-                    if (depth + 1 < present.size()) metadata << ",\n" << pad << "\t\"child\": {\n";
-                    else metadata << "\n";
-                }
-                for (size_t depth = present.size(); depth-- > 0;) {
-                    const std::string pad(5 + depth, '\t');
-                    metadata << pad << "}";
-                    if (depth > 0) metadata << "\n" << std::string(5 + depth - 1, '\t') << "}\n";
-                    else metadata << "\n\t\t\t\t}\n";
-                }
+                    if (depth + 1 < present.size()) {
+                        const size_t child_lod = present[depth + 1];
+                        metadata << ",\n" << pad << "\"child\": {\n"
+                                 << pad << "\t\"" << child_lod << "\": {\n"
+                                 << pad << "\t\t\"id\": \"cell-" << cell_id << "-lod-" << child_lod << "\",\n"
+                                 << pad << "\t\t\"boundingBox\": ";
+                        write_bbox(metadata, cell_bbox, indent + 2);
+                        write_lod_fields(depth + 1, indent + 2);
+                        metadata << "\n" << pad << "\t}\n" << pad << "}";
+                    }
+                };
+                write_lod_fields(0, 4);
+                metadata << "\n";
             }
             metadata << "\t\t\t}" << (++cell_number == grid.cells().size() ? "\n" : ",\n");
         }

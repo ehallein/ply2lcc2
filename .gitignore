@@ -11,6 +11,9 @@ LCCWhitepaper/
 .idea/
 *.swp
 
+# macOS metadata
+.DS_Store
+
 # Compiled objects
 *.o
 *.obj

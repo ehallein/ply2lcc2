@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstddef>
+#include <cerrno>
 
 #include <vector>
 #include <string>
@@ -13,11 +14,13 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
+#include <process.h>
 #else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 namespace platform {
@@ -154,6 +157,44 @@ inline FILE* fopen(const fs::path& path, const char* mode) {
     return _wfopen(path.wstring().c_str(), wmode);
 #else
     return std::fopen(path.c_str(), mode);
+#endif
+}
+
+/// Run a process without involving a shell. The first item is the executable.
+/// Returns its exit code, or 127 when it could not be launched.
+inline int run_process(const std::vector<fs::path>& arguments) {
+    if (arguments.empty()) return 127;
+#ifdef _WIN32
+    std::vector<std::wstring> storage;
+    storage.reserve(arguments.size());
+    for (const auto& argument : arguments) storage.push_back(argument.wstring());
+    std::vector<const wchar_t*> argv;
+    argv.reserve(storage.size() + 1);
+    for (const auto& argument : storage) argv.push_back(argument.c_str());
+    argv.push_back(nullptr);
+    const intptr_t result = _wspawnvp(_P_WAIT, argv.front(), argv.data());
+    return result == -1 ? 127 : static_cast<int>(result);
+#else
+    const pid_t pid = ::fork();
+    if (pid < 0) return 127;
+    if (pid == 0) {
+        std::vector<std::string> storage;
+        storage.reserve(arguments.size());
+        for (const auto& argument : arguments) storage.push_back(argument.string());
+        std::vector<char*> argv;
+        argv.reserve(storage.size() + 1);
+        for (auto& argument : storage) argv.push_back(argument.data());
+        argv.push_back(nullptr);
+        ::execvp(argv.front(), argv.data());
+        ::_exit(127);
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return 127;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 127;
 #endif
 }
 

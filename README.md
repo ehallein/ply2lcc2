@@ -1,6 +1,6 @@
 # ply2lcc
 
-A high-performance converter for 3D Gaussian Splatting (3DGS) PLY files to LCC format.
+A high-performance converter for 3D Gaussian Splatting (3DGS) PLY files to LCC and LCC2 packages.
 
 ## Features
 
@@ -9,6 +9,7 @@ A high-performance converter for 3D Gaussian Splatting (3DGS) PLY files to LCC f
 - **Multi-LOD support**: Automatic detection and processing of LOD files (point_cloud_1.ply, point_cloud_2.ply, etc.)
 - **Environment support**: Separate processing of environment splats (environment.ply)
 - **SH coefficient encoding**: Full support for spherical harmonic coefficients (degree 3)
+- **SuperSplat-compatible LCC2 LODs**: Offline hierarchies packaged as validated SPZ v4 payloads
 
 ## Build
 
@@ -23,8 +24,8 @@ make -j$(nproc)
 ### LCC2 output
 
 Use `--format lcc2` (or `--lcc2`) to create an LCC2 v0.0.3 package. The
-package contains `meta.lcc2`, `LCC2-NOTICE.md`, and the source PLY data under
-`data/3dgs/`:
+package contains `meta.lcc2`, `LCC2-NOTICE.md`, and its PLY or SPZ payloads
+under `data/3dgs/`:
 
 ```bash
 ./ply2lcc -i input.ply -o output_lcc2 --format lcc2
@@ -43,28 +44,72 @@ the corresponding PLY before writing the package.
 
 ### Offline LOD generation
 
-Generate a deterministic coarse-to-fine hierarchy for LCC2 with:
+Generated LOD output requires
+[`splat-transform`](https://github.com/playcanvas/splat-transform), which
+performs the PLY-to-SPZ v4 encoding. Install it first:
 
 ```bash
-./ply2lcc -i garden.spz -o garden_lcc2 --format lcc2 \
+npm install -g @playcanvas/splat-transform
+```
+
+Then generate a deterministic hierarchy from a PLY:
+
+```bash
+./ply2lcc -i garden.ply -o garden_lcc2 --format lcc2 \
   --generate-lod --lod-levels 5 --lod-reduction 4 --lod-method cluster
 ```
 
+If `splat-transform` is not on `PATH`, pass its executable explicitly:
+
+```bash
+./ply2lcc -i garden.ply -o garden_lcc2 --format lcc2 \
+  --generate-lod --splat-transform /path/to/splat-transform
+```
+
 SPZ input currently requires a matching PLY with the same stem because this
-project decodes Gaussian attributes from PLY. Generated coarse levels are
-RGB-only binary PLY payloads; the finest level preserves the source PLY's SH
-attributes. The original non-LOD SPZ packaging path is unchanged.
+project decodes Gaussian attributes from PLY. All generated SPZ files use the
+same SH degree as the source, as required by the PlayCanvas LCC2 reader.
+Clustered representatives use zero higher-band SH coefficients; decimated
+representatives retain the selected source coefficients. The finest level
+preserves the complete source SH data.
 
 `cluster` uses spatial Morton ordering, a colour similarity threshold, weighted
 centroids, accumulated alpha, and covariance moment matching. `decimate` uses
 spatially stratified importance selection. Generated metadata partitions every
 level into contiguous spatial-cell ranges and stores `lodError` as the maximum
 centre displacement plus representative-radius difference introduced by that
-level (accumulated toward coarser levels).
+level (accumulated toward coarser levels). Canonical LCC2 metadata is written
+finest-first, while the spatial tree nests progressively finer data below each
+coarse cell node.
 
-LCC2 output currently includes 3DGS LOD files and an optional environment PLY.
-Collision meshes and trajectory poses remain available only in the original LCC
-output.
+The generated directory has this structure:
+
+```text
+garden_lcc2/
+├── meta.lcc2
+├── LCC2-NOTICE.md
+└── data/3dgs/
+    ├── lod_0.spz
+    ├── ...
+    └── lod_4.spz
+```
+
+Import `meta.lcc2` into SuperSplat rather than opening an individual SPZ file;
+the metadata connects the payloads into the spatial LOD hierarchy. You can
+also fully decode and validate every LOD with `splat-transform`:
+
+```bash
+splat-transform garden_lcc2/meta.lcc2 --stats json null
+```
+
+The conversion fails rather than writing a partial package if an SPZ encoder
+exits unsuccessfully, omits an output, writes a version other than SPZ v4, or
+produces a mismatched splat count or SH degree.
+
+LCC2 output currently includes 3DGS LOD files. An environment PLY is supported
+only when the LCC2 splat payloads are also PLY; it cannot be mixed with SPZ
+payloads. Collision meshes and trajectory poses remain available only in the
+original LCC output.
 
 ### With GUI (requires Qt5 or Qt6)
 
@@ -102,6 +147,7 @@ This builds both the CLI (`ply2lcc`) and GUI (`ply2lcc-gui`) executables.
 | `--format lcc\|lcc2` | Select the output format | `lcc` |
 | `--lcc2-payload <path>` | Use a matching PLY or SPZ v4 payload in LCC2 output; repeat per LOD | Input PLY |
 | `--generate-lod` | Generate an offline spatial LOD hierarchy (LCC2 only) | false |
+| `--splat-transform <path>` | Path to the SPZ encoder used for generated LODs | Search `PATH` |
 | `--lod-levels <n>` | Total generated levels, including the original | 5 |
 | `--lod-reduction <n>` | Approximate reduction factor per level | 4 |
 | `--lod-method cluster\|decimate` | LOD generation strategy | `cluster` |

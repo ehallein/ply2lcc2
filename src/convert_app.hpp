@@ -40,6 +40,7 @@ private:
     bool single_lod_ = false;
     OutputFormat output_format_ = OutputFormat::Lcc;
     std::vector<std::filesystem::path> lcc2_payload_files_;
+    std::filesystem::path splat_transform_path_ = "splat-transform";
     LodSettings lod_settings_;
     std::filesystem::path input_spz_path_;
     std::filesystem::path generated_lod_dir_;

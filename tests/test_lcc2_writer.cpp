@@ -12,7 +12,7 @@ using namespace ply2lcc;
 
 namespace {
 
-void write_test_splats(const fs::path& path) {
+void write_test_splats(const fs::path& path, int num_f_rest = 0) {
     std::ofstream file(path, std::ios::binary);
     ASSERT_TRUE(file);
     file << "ply\n"
@@ -23,8 +23,11 @@ void write_test_splats(const fs::path& path) {
          << "property float z\n"
          << "property float f_dc_0\n"
          << "property float f_dc_1\n"
-         << "property float f_dc_2\n"
-         << "property float opacity\n"
+         << "property float f_dc_2\n";
+    for (int i = 0; i < num_f_rest; ++i) {
+        file << "property float f_rest_" << i << "\n";
+    }
+    file << "property float opacity\n"
          << "property float scale_0\n"
          << "property float scale_1\n"
          << "property float scale_2\n"
@@ -40,8 +43,13 @@ void write_test_splats(const fs::path& path) {
         {{4.0f, 5.0f, 6.0f, 0.4f, 0.5f, 0.6f, 1.0f,
           0.1f, 0.2f, 0.3f, 1.0f, 0.0f, 0.0f, 0.0f}}
     }};
-    file.write(reinterpret_cast<const char*>(rows.data()),
-               static_cast<std::streamsize>(sizeof(rows)));
+    const std::vector<float> rest(static_cast<size_t>(num_f_rest), 0.0f);
+    for (const auto& row : rows) {
+        file.write(reinterpret_cast<const char*>(row.data()), 6 * sizeof(float));
+        file.write(reinterpret_cast<const char*>(rest.data()),
+                   static_cast<std::streamsize>(rest.size() * sizeof(float)));
+        file.write(reinterpret_cast<const char*>(row.data() + 6), 8 * sizeof(float));
+    }
     ASSERT_TRUE(file);
 }
 
@@ -151,7 +159,7 @@ TEST(Lcc2WriterTest, GeneratedLodUsesSpatialHierarchyAndErrorMetadata) {
     fs::create_directories(base);
     const fs::path input = base / "scene.ply";
     const fs::path output = base / "output";
-    write_test_splats(input);
+    write_test_splats(input, 9);
 
     ConvertConfig config;
     config.input_path = input;
@@ -162,17 +170,33 @@ TEST(Lcc2WriterTest, GeneratedLodUsesSpatialHierarchyAndErrorMetadata) {
     config.lod.levels = 2;
     config.lod.reduction = 2;
     config.lod.method = LodMethod::Decimate;
+    config.splat_transform_path = PLY2LCC_FAKE_SPLAT_TRANSFORM;
     ConvertApp app(config);
     app.run();
 
     const std::string metadata = read_text(output / "meta.lcc2");
     EXPECT_NE(metadata.find("\"lodErrors\":"), std::string::npos);
+    EXPECT_NE(metadata.find("\"lodSplats\": [2, 1]"), std::string::npos);
     EXPECT_NE(metadata.find("\"lodLevel\": 0"), std::string::npos);
     EXPECT_NE(metadata.find("\"lodError\":"), std::string::npos);
     EXPECT_NE(metadata.find("\"start\":"), std::string::npos);
     EXPECT_NE(metadata.find("\"count\":"), std::string::npos);
-    EXPECT_TRUE(fs::exists(output / "data" / "3dgs" / "lod_0.ply"));
-    EXPECT_TRUE(fs::exists(output / "data" / "3dgs" / "lod_1.ply"));
+    EXPECT_NE(metadata.find("\"splatType\": \".spz\""), std::string::npos);
+    const size_t cell = metadata.find("\"id\": \"cell-0\"");
+    const size_t cell_data = metadata.find("\"data\": {\"3dgs\"", cell);
+    const size_t cell_child = metadata.find("\"child\": {", cell);
+    ASSERT_NE(cell, std::string::npos);
+    ASSERT_NE(cell_data, std::string::npos);
+    ASSERT_NE(cell_child, std::string::npos);
+    EXPECT_LT(cell_data, cell_child);
+    EXPECT_NE(metadata.find("\"lodLevel\": 1", cell), std::string::npos);
+    EXPECT_TRUE(fs::exists(output / "data" / "3dgs" / "lod_0.spz"));
+    EXPECT_TRUE(fs::exists(output / "data" / "3dgs" / "lod_1.spz"));
+    std::ifstream coarse_spz(output / "data" / "3dgs" / "lod_0.spz", std::ios::binary);
+    std::array<uint8_t, 13> coarse_header{};
+    coarse_spz.read(reinterpret_cast<char*>(coarse_header.data()), coarse_header.size());
+    ASSERT_TRUE(coarse_spz);
+    EXPECT_EQ(coarse_header[12], 1);
     EXPECT_FALSE(fs::exists(output / ".generated_lod"));
     fs::remove_all(base);
 }

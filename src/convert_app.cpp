@@ -6,6 +6,7 @@
 #include "lcc2_writer.hpp"
 #include "collision_encoder.hpp"
 #include "splat_buffer.hpp"
+#include "platform.hpp"
 
 #include <iostream>
 #include <filesystem>
@@ -31,6 +32,7 @@ ConvertApp::ConvertApp(const ConvertConfig& config)
     , single_lod_(config.single_lod)
     , output_format_(config.output_format)
     , lcc2_payload_files_(config.lcc2_payload_paths)
+    , splat_transform_path_(config.splat_transform_path)
     , lod_settings_(config.lod)
     , include_env_(config.include_env)
     , include_collision_(config.include_collision)
@@ -187,6 +189,7 @@ void ConvertApp::printUsage() {
               << "  --lcc2             Shortcut for --format lcc2\n"
               << "  --lcc2-payload P   Store PLY/SPZ payload P in LCC2 output (repeat per LOD)\n"
               << "  --generate-lod     Generate offline LOD levels (LCC2 only)\n"
+              << "  --splat-transform P Path to splat-transform (default: search PATH)\n"
               << "  --lod-levels N     Total levels including original (default: 5)\n"
               << "  --lod-reduction N  Approximate reduction per level (default: 4)\n"
               << "  --lod-method M     cluster (default) or decimate\n"
@@ -233,6 +236,9 @@ void ConvertApp::parseArgs() {
             lcc2_payload_files_.push_back(fs::u8path(argv_[++i]));
         } else if (arg == "--generate-lod") {
             lod_settings_.generate = true;
+        } else if (arg == "--splat-transform") {
+            if (i + 1 >= argc_) throw std::runtime_error("Missing path for --splat-transform");
+            splat_transform_path_ = fs::u8path(argv_[++i]);
         } else if (arg == "--lod-levels") {
             if (i + 1 >= argc_) throw std::runtime_error("Missing value for --lod-levels");
             lod_settings_.levels = static_cast<size_t>(std::stoul(argv_[++i]));
@@ -427,20 +433,20 @@ void ConvertApp::generateLods() {
     generated_lod_dir_ = output_dir_ / ".generated_lod";
     fs::create_directories(generated_lod_dir_);
     lod_files_.clear();
+    lcc2_payload_files_.clear();
     lod_errors_.clear();
     lod_stats_.clear();
     for (size_t lod = 0; lod < levels.size(); ++lod) {
-        const bool original = lod + 1 == levels.size();
         std::stable_sort(levels[lod].splats.begin(), levels[lod].splats.end(),
                          [&](const Splat& a, const Splat& b) { return cell_index(a.pos) < cell_index(b.pos); });
         const fs::path path = generated_lod_dir_ / ("lod_" + std::to_string(lod) + ".ply");
-        LodGenerator::write_binary_ply(path, levels[lod].splats, original ? source.num_f_rest() : 0);
+        LodGenerator::write_binary_ply(path, levels[lod].splats, source.num_f_rest());
         lod_files_.push_back(path);
         lod_errors_.push_back(levels[lod].error);
         lod_stats_.push_back(levels[lod].stats);
         log("  LOD" + std::to_string(lod) + ": " + std::to_string(levels[lod].splats.size()) +
             " splats, error " + std::to_string(levels[lod].error) + "\n");
-        if (lod_settings_.debug && !original) {
+        if (lod_settings_.debug && lod + 1 < levels.size()) {
             const auto& stats = levels[lod].stats;
             log("    clusters: " + std::to_string(stats.cluster_count) +
                 ", avg/min/max size: " + std::to_string(stats.average_cluster_size) + "/" +
@@ -449,10 +455,27 @@ void ConvertApp::generateLods() {
                 ", rejected merges: " + std::to_string(stats.rejected_merges) + "\n");
         }
     }
-    if (!input_spz_path_.empty() || !lcc2_payload_files_.empty()) {
-        log("  note: generated hierarchy uses PLY payloads because no SPZ encoder is available\n");
+
+    log("  encoding SPZ v4 payloads with splat-transform\n");
+    for (size_t lod = 0; lod < lod_files_.size(); ++lod) {
+        const fs::path spz_path = generated_lod_dir_ / ("lod_" + std::to_string(lod) + ".spz");
+        const std::vector<fs::path> command{
+            splat_transform_path_, "--quiet", "--overwrite", "--spz-version", "4",
+            lod_files_[lod], spz_path
+        };
+        const int exit_code = platform::run_process(command);
+        if (exit_code != 0) {
+            throw std::runtime_error(
+                "splat-transform failed while encoding LOD" + std::to_string(lod) +
+                " as SPZ v4 (exit code " + std::to_string(exit_code) +
+                "). Install @playcanvas/splat-transform or pass --splat-transform <path>");
+        }
+        if (!fs::exists(spz_path)) {
+            throw std::runtime_error("splat-transform did not create " + spz_path.u8string());
+        }
+        Lcc2Writer::validate_spz_v4(spz_path, levels[lod].splats.size(), source.sh_degree());
+        lcc2_payload_files_.push_back(spz_path);
     }
-    lcc2_payload_files_.clear();
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     log("  generation time: " + std::to_string(seconds) + " seconds\n");
 }
