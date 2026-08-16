@@ -114,7 +114,7 @@ void ConvertApp::run() {
 
         reportProgress(90, "Writing LCC2 package...");
         log("\nPhase 2: Writing LCC2 package...\n");
-        Lcc2Writer writer(output_dir_);
+        Lcc2Writer writer(output_dir_, splat_transform_path_);
         writer.write(grid, lod_files_, lcc2_payload_files_, env_file_, base_name_, lod_errors_);
         if (!generated_lod_dir_.empty()) {
             fs::remove_all(generated_lod_dir_);

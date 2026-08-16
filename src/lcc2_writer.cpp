@@ -1,4 +1,5 @@
 #include "lcc2_writer.hpp"
+#include "lod_generator.hpp"
 #include "platform.hpp"
 #include "splat_buffer.hpp"
 
@@ -63,10 +64,40 @@ std::string lowercase_extension(const fs::path& path) {
     return extension;
 }
 
+// LCC/LCC2 payload coordinates have an additional +90 degree X-axis source
+// transform compared with ordinary PLY/SPZ coordinates. Pre-rotate payload
+// data by -90 degrees so loading the resulting LCC2 reproduces the input pose.
+void transform_splat_to_lcc2(Splat& splat) {
+    splat.pos = Vec3f(splat.pos.x, splat.pos.z, -splat.pos.y);
+    splat.normal = Vec3f(splat.normal.x, splat.normal.z, -splat.normal.y);
+
+    // q' = rotation_x(-90 degrees) * q, with quaternions stored as w,x,y,z.
+    constexpr float c = 0.7071067811865475244f;
+    const float w = splat.rot[0];
+    const float x = splat.rot[1];
+    const float y = splat.rot[2];
+    const float z = splat.rot[3];
+    splat.rot[0] = c * (w + x);
+    splat.rot[1] = c * (x - w);
+    splat.rot[2] = c * (y + z);
+    splat.rot[3] = c * (z - y);
+}
+
+void write_transformed_ply(const fs::path& source, const fs::path& destination) {
+    SplatBuffer buffer;
+    if (!buffer.initialize(source)) {
+        throw std::runtime_error("Failed to transform " + source.u8string() + ": " + buffer.error());
+    }
+    std::vector<Splat> splats = buffer.to_vector();
+    for (Splat& splat : splats) transform_splat_to_lcc2(splat);
+    LodGenerator::write_binary_ply(destination, splats, buffer.num_f_rest());
+}
+
 } // namespace
 
-Lcc2Writer::Lcc2Writer(const fs::path& output_dir)
-    : output_dir_(output_dir) {}
+Lcc2Writer::Lcc2Writer(const fs::path& output_dir,
+                       const fs::path& splat_transform_path)
+    : output_dir_(output_dir), splat_transform_path_(splat_transform_path) {}
 
 void Lcc2Writer::validate_spz_v4(const fs::path& path, size_t point_count, int sh_degree) {
     const SpzHeaderInfo spz = inspect_spz_v4(path);
@@ -121,6 +152,13 @@ void Lcc2Writer::write_bbox(std::ostream& stream, const BBox& bbox, int indent) 
            << pad << "}";
 }
 
+BBox Lcc2Writer::to_lcc2_bbox(const BBox& bbox) {
+    BBox result;
+    result.min = Vec3f(bbox.min.x, bbox.min.z, -bbox.max.y);
+    result.max = Vec3f(bbox.max.x, bbox.max.z, -bbox.min.y);
+    return result;
+}
+
 void Lcc2Writer::write(const SpatialGrid& grid,
                        const std::vector<fs::path>& lod_files,
                        const std::vector<fs::path>& payload_files,
@@ -172,7 +210,25 @@ void Lcc2Writer::write(const SpatialGrid& grid,
         }
 
         const std::string filename = "lod_" + std::to_string(lod) + splat_extension;
-        fs::copy_file(payloads[lod], splat_dir / filename, fs::copy_options::overwrite_existing);
+        const fs::path destination = splat_dir / filename;
+        if (splat_extension == ".spz") {
+            const std::vector<fs::path> command{
+                splat_transform_path_, "--quiet", "--overwrite", "--spz-version", "4",
+                // splat-transform rotations are expressed in engine space. Its
+                // PLY/SPZ source transform includes a 180-degree Z rotation, so
+                // +90 here produces the required -90 X rotation in raw payload space.
+                payloads[lod], "--rotate", "90,0,0", destination
+            };
+            const int exit_code = platform::run_process(command);
+            if (exit_code != 0) {
+                throw std::runtime_error(
+                    "splat-transform failed while rotating LCC2 payload " + payloads[lod].u8string() +
+                    " (exit code " + std::to_string(exit_code) + ")");
+            }
+            validate_spz_v4(destination, splats.size(), splats.sh_degree());
+        } else {
+            write_transformed_ply(payloads[lod], destination);
+        }
         relative_files.push_back("data/3dgs/" + filename);
         lod_counts.push_back(splats.size());
         total_splats += splats.size();
@@ -188,9 +244,9 @@ void Lcc2Writer::write(const SpatialGrid& grid,
             throw std::runtime_error("Failed to inspect " + environment_file.u8string() + ": " + environment.error());
         }
         environment_count = environment.size();
-        environment_bbox = environment.compute_bbox();
+        environment_bbox = to_lcc2_bbox(environment.compute_bbox());
         environment_file_index = relative_files.size();
-        fs::copy_file(environment_file, splat_dir / "environment.ply", fs::copy_options::overwrite_existing);
+        write_transformed_ply(environment_file, splat_dir / "environment.ply");
         relative_files.push_back("data/3dgs/environment.ply");
     }
 
@@ -248,7 +304,8 @@ void Lcc2Writer::write(const SpatialGrid& grid,
              << "\t\"root\": {\n"
              << "\t\t\"id\": \"0\",\n"
              << "\t\t\"boundingBox\": ";
-    write_bbox(metadata, grid.bbox(), 2);
+    const BBox lcc2_scene_bbox = to_lcc2_bbox(grid.bbox());
+    write_bbox(metadata, lcc2_scene_bbox, 2);
     metadata << ",\n"
              << "\t\t\"childNum\": " << (lod_errors.empty() ? lod_files.size() : grid.cells().size()) << ",\n"
              << "\t\t\"data\": ";
@@ -271,7 +328,7 @@ void Lcc2Writer::write(const SpatialGrid& grid,
             metadata << "\t\t\t\"" << lod << "\": {\n"
                      << "\t\t\t\t\"id\": \"0-" << lod << "\",\n"
                      << "\t\t\t\t\"boundingBox\": ";
-            write_bbox(metadata, grid.bbox(), 4);
+            write_bbox(metadata, lcc2_scene_bbox, 4);
             metadata << ",\n"
                      << "\t\t\t\t\"childNum\": 0,\n"
                      << "\t\t\t\t\"data\": {\"3dgs\": {\"name\": " << lod
@@ -297,6 +354,7 @@ void Lcc2Writer::write(const SpatialGrid& grid,
             metadata << "\t\t\t\"" << cell_number << "\": {\n"
                      << "\t\t\t\t\"id\": \"cell-" << cell_id << "\",\n"
                      << "\t\t\t\t\"boundingBox\": ";
+            cell_bbox = to_lcc2_bbox(cell_bbox);
             write_bbox(metadata, cell_bbox, 4);
             if (present.empty()) {
                 metadata << ",\n\t\t\t\t\"childNum\": 0,\n"

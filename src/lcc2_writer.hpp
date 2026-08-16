@@ -10,7 +10,8 @@ namespace ply2lcc {
 
 class Lcc2Writer {
 public:
-    explicit Lcc2Writer(const std::filesystem::path& output_dir);
+    explicit Lcc2Writer(const std::filesystem::path& output_dir,
+                        const std::filesystem::path& splat_transform_path = "splat-transform");
 
     static void validate_spz_v4(const std::filesystem::path& path,
                                 size_t point_count, int sh_degree);
@@ -26,8 +27,10 @@ private:
     static std::string generate_guid();
     static std::string json_escape(const std::string& value);
     static void write_bbox(std::ostream& stream, const BBox& bbox, int indent);
+    static BBox to_lcc2_bbox(const BBox& bbox);
 
     std::filesystem::path output_dir_;
+    std::filesystem::path splat_transform_path_;
 };
 
 } // namespace ply2lcc

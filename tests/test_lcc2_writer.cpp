@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "convert_app.hpp"
+#include "splat_buffer.hpp"
 
 #include <array>
 #include <filesystem>
@@ -106,7 +107,17 @@ TEST(Lcc2WriterTest, CreatesVersion003PackageWithReferencedPly) {
     ASSERT_TRUE(fs::exists(metadata_path));
     ASSERT_TRUE(fs::exists(notice_path));
     ASSERT_TRUE(fs::exists(copied_ply));
-    EXPECT_EQ(fs::file_size(copied_ply), fs::file_size(input));
+    SplatBuffer exported;
+    ASSERT_TRUE(exported.initialize(copied_ply)) << exported.error();
+    ASSERT_EQ(exported.size(), 2u);
+    EXPECT_FLOAT_EQ(exported.pos(0).x, -1.0f);
+    EXPECT_FLOAT_EQ(exported.pos(0).y, -3.0f);
+    EXPECT_FLOAT_EQ(exported.pos(0).z, 2.0f);
+    const Quat rotation = exported[0].rot();
+    EXPECT_NEAR(rotation.w, 0.70710678f, 1e-6f);
+    EXPECT_NEAR(rotation.x, -0.70710678f, 1e-6f);
+    EXPECT_NEAR(rotation.y, 0.0f, 1e-6f);
+    EXPECT_NEAR(rotation.z, 0.0f, 1e-6f);
 
     const std::string metadata = read_text(metadata_path);
     EXPECT_NE(metadata.find("\"version\": \"0.0.3\""), std::string::npos);
@@ -114,6 +125,8 @@ TEST(Lcc2WriterTest, CreatesVersion003PackageWithReferencedPly) {
     EXPECT_NE(metadata.find("\"totalSplats\": 2"), std::string::npos);
     EXPECT_NE(metadata.find("\"lodSplats\": [2]"), std::string::npos);
     EXPECT_NE(metadata.find("\"splatFiles\": [\"data/3dgs/lod_0.ply\"]"), std::string::npos);
+    EXPECT_NE(metadata.find("\"min\": [-1, -3, -5]"), std::string::npos);
+    EXPECT_NE(metadata.find("\"max\": [4, 6, 2]"), std::string::npos);
     EXPECT_NE(metadata.find("\"3dgs\": {\"name\": 0, \"start\": 0, \"count\": 2}"),
               std::string::npos);
     EXPECT_NE(read_text(notice_path).find("https://github.com/xgrids/LCC2Whitepaper"),
@@ -138,6 +151,7 @@ TEST(Lcc2WriterTest, StoresMatchingSpzV4Payload) {
     config.output_dir = output;
     config.output_format = OutputFormat::Lcc2;
     config.lcc2_payload_paths = {payload};
+    config.splat_transform_path = PLY2LCC_FAKE_SPLAT_TRANSFORM;
     config.include_env = false;
 
     ConvertApp app(config);
