@@ -25,6 +25,8 @@ add_executable(ply2lcc
     src/grid_encoder.cpp
     src/lcc_types.cpp
     src/lcc_writer.cpp
+    src/lcc2_writer.cpp
+    src/lod_generator.cpp
     src/collision_encoder.cpp
     external/miniply/miniply.cpp
 )
@@ -62,6 +64,8 @@ if(BUILD_TESTS OR BUILD_GUI)
         src/grid_encoder.cpp
         src/lcc_types.cpp
         src/lcc_writer.cpp
+        src/lcc2_writer.cpp
+        src/lod_generator.cpp
         src/collision_encoder.cpp
         external/miniply/miniply.cpp
     )
@@ -100,10 +104,18 @@ if(BUILD_TESTS)
     add_executable(test_integration tests/test_integration.cpp)
     target_link_libraries(test_integration ply2lcc_lib GTest::gtest_main)
 
+    add_executable(test_lcc2_writer tests/test_lcc2_writer.cpp)
+    target_link_libraries(test_lcc2_writer ply2lcc_lib GTest::gtest_main)
+
+    add_executable(test_lod_generator tests/test_lod_generator.cpp)
+    target_link_libraries(test_lod_generator ply2lcc_lib GTest::gtest_main)
+
     include(GoogleTest)
     gtest_discover_tests(test_compression)
     gtest_discover_tests(test_types)
     gtest_discover_tests(test_integration)
+    gtest_discover_tests(test_lcc2_writer)
+    gtest_discover_tests(test_lod_generator)
 
     add_executable(test_platform tests/test_platform.cpp)
     target_include_directories(test_platform PRIVATE ${CMAKE_SOURCE_DIR}/src)

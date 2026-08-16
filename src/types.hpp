@@ -13,6 +13,24 @@
 
 namespace ply2lcc {
 
+enum class OutputFormat {
+    Lcc,
+    Lcc2
+};
+
+enum class LodMethod {
+    Decimate,
+    Cluster
+};
+
+struct LodSettings {
+    bool generate = false;
+    size_t levels = 5;
+    size_t reduction = 4;
+    LodMethod method = LodMethod::Cluster;
+    bool debug = false;
+};
+
 struct Vec3f {
     float x, y, z;
 
@@ -188,6 +206,9 @@ struct ConvertConfig {
     float cell_size_x = 30.0f;
     float cell_size_y = 30.0f;
     bool single_lod = false;
+    OutputFormat output_format = OutputFormat::Lcc;
+    std::vector<std::filesystem::path> lcc2_payload_paths;
+    LodSettings lod;
     bool include_env = true;
     std::filesystem::path env_path;
     bool include_collision = false;

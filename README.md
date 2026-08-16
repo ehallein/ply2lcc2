@@ -20,6 +20,52 @@ cmake .. -DBUILD_TESTS=ON
 make -j$(nproc)
 ```
 
+### LCC2 output
+
+Use `--format lcc2` (or `--lcc2`) to create an LCC2 v0.0.3 package. The
+package contains `meta.lcc2`, `LCC2-NOTICE.md`, and the source PLY data under
+`data/3dgs/`:
+
+```bash
+./ply2lcc -i input.ply -o output_lcc2 --format lcc2
+```
+
+To store an existing SPZ v4 payload while using its matching PLY for spatial
+metadata, add one `--lcc2-payload` per LOD:
+
+```bash
+./ply2lcc -i garden.ply -o garden_lcc2 --format lcc2 \
+  --lcc2-payload garden.spz
+```
+
+The converter verifies that each SPZ payload's splat count and SH degree match
+the corresponding PLY before writing the package.
+
+### Offline LOD generation
+
+Generate a deterministic coarse-to-fine hierarchy for LCC2 with:
+
+```bash
+./ply2lcc -i garden.spz -o garden_lcc2 --format lcc2 \
+  --generate-lod --lod-levels 5 --lod-reduction 4 --lod-method cluster
+```
+
+SPZ input currently requires a matching PLY with the same stem because this
+project decodes Gaussian attributes from PLY. Generated coarse levels are
+RGB-only binary PLY payloads; the finest level preserves the source PLY's SH
+attributes. The original non-LOD SPZ packaging path is unchanged.
+
+`cluster` uses spatial Morton ordering, a colour similarity threshold, weighted
+centroids, accumulated alpha, and covariance moment matching. `decimate` uses
+spatially stratified importance selection. Generated metadata partitions every
+level into contiguous spatial-cell ranges and stores `lodError` as the maximum
+centre displacement plus representative-radius difference introduced by that
+level (accumulated toward coarser levels).
+
+LCC2 output currently includes 3DGS LOD files and an optional environment PLY.
+Collision meshes and trajectory poses remain available only in the original LCC
+output.
+
 ### With GUI (requires Qt5 or Qt6)
 
 ```bash
@@ -53,6 +99,22 @@ This builds both the CLI (`ply2lcc`) and GUI (`ply2lcc-gui`) executables.
 | `-m <path>` | Path to collision.ply | Auto-detect in input dir |
 | `--cell-size X,Y` | Grid cell size in meters | 30,30 |
 | `--single-lod` | Use only LOD0 even if more exist | false |
+| `--format lcc\|lcc2` | Select the output format | `lcc` |
+| `--lcc2-payload <path>` | Use a matching PLY or SPZ v4 payload in LCC2 output; repeat per LOD | Input PLY |
+| `--generate-lod` | Generate an offline spatial LOD hierarchy (LCC2 only) | false |
+| `--lod-levels <n>` | Total generated levels, including the original | 5 |
+| `--lod-reduction <n>` | Approximate reduction factor per level | 4 |
+| `--lod-method cluster\|decimate` | LOD generation strategy | `cluster` |
+| `--lod-debug` | Print cluster size/error/rejection details | false |
+
+## LCC2 attribution
+
+The LCC2 data organization format originated from XGRIDS. This project is an
+independent implementation and is not an official XGRIDS implementation. See
+[the LCC2 whitepaper](https://github.com/xgrids/LCC2Whitepaper) for the format
+specification and its license and redistribution conditions. The LCC2 support
+in this project modifies the organization described by the whitepaper by mapping
+generated LOD ranges into spatial nodes beneath the root.
 
 ## GUI Usage
 

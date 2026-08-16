@@ -224,6 +224,7 @@ TEST(SplatTest, DefaultValues) {
 TEST(ConvertConfigTest, DefaultValues) {
     ConvertConfig config;
     EXPECT_EQ(config.single_lod, false);
+    EXPECT_EQ(config.output_format, OutputFormat::Lcc);
     EXPECT_FLOAT_EQ(config.cell_size_x, 30.0f);
     EXPECT_FLOAT_EQ(config.cell_size_y, 30.0f);
 }

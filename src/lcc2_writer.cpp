@@ -1,0 +1,369 @@
+#include "lcc2_writer.hpp"
+#include "platform.hpp"
+#include "splat_buffer.hpp"
+
+#include <fstream>
+#include <array>
+#include <cctype>
+#include <cstdint>
+#include <iomanip>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+
+namespace fs = std::filesystem;
+
+namespace ply2lcc {
+
+namespace {
+
+struct SpzHeaderInfo {
+    uint32_t point_count;
+    uint8_t sh_degree;
+};
+
+uint32_t read_u32_le(const uint8_t* bytes) {
+    return static_cast<uint32_t>(bytes[0]) |
+           (static_cast<uint32_t>(bytes[1]) << 8) |
+           (static_cast<uint32_t>(bytes[2]) << 16) |
+           (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+SpzHeaderInfo inspect_spz_v4(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    std::array<uint8_t, 32> header{};
+    file.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    if (file.gcount() != static_cast<std::streamsize>(header.size())) {
+        throw std::runtime_error("SPZ file is too short: " + path.u8string());
+    }
+
+    constexpr uint32_t NGSP_MAGIC = 0x5053474e;
+    const uint32_t magic = read_u32_le(header.data());
+    const uint32_t version = read_u32_le(header.data() + 4);
+    const uint32_t point_count = read_u32_le(header.data() + 8);
+    const uint8_t sh_degree = header[12];
+    const uint8_t stream_count = header[15];
+    const uint32_t toc_offset = read_u32_le(header.data() + 16);
+
+    if (magic != NGSP_MAGIC || version != 4) {
+        throw std::runtime_error("Unsupported SPZ payload (expected NGSP version 4): " + path.u8string());
+    }
+    if (point_count == 0 || sh_degree > 4 || stream_count == 0 || toc_offset < header.size()) {
+        throw std::runtime_error("Invalid SPZ v4 header: " + path.u8string());
+    }
+    return {point_count, sh_degree};
+}
+
+std::string lowercase_extension(const fs::path& path) {
+    std::string extension = path.extension().u8string();
+    for (char& c : extension) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return extension;
+}
+
+} // namespace
+
+Lcc2Writer::Lcc2Writer(const fs::path& output_dir)
+    : output_dir_(output_dir) {}
+
+void Lcc2Writer::validate_spz_v4(const fs::path& path, size_t point_count, int sh_degree) {
+    const SpzHeaderInfo spz = inspect_spz_v4(path);
+    if (spz.point_count != point_count) {
+        throw std::runtime_error("SPZ/PLY splat count mismatch: " + path.u8string());
+    }
+    if (spz.sh_degree != static_cast<uint8_t>(sh_degree)) {
+        throw std::runtime_error("SPZ/PLY SH degree mismatch: " + path.u8string());
+    }
+}
+
+std::string Lcc2Writer::generate_guid() {
+    std::random_device rd;
+    std::mt19937 generator(rd());
+    std::uniform_int_distribution<int> hex_digit(0, 15);
+    std::ostringstream result;
+    result << std::hex;
+    for (int i = 0; i < 32; ++i) {
+        result << hex_digit(generator);
+    }
+    return result.str();
+}
+
+std::string Lcc2Writer::json_escape(const std::string& value) {
+    std::ostringstream escaped;
+    for (unsigned char c : value) {
+        switch (c) {
+        case '\"': escaped << "\\\""; break;
+        case '\\': escaped << "\\\\"; break;
+        case '\b': escaped << "\\b"; break;
+        case '\f': escaped << "\\f"; break;
+        case '\n': escaped << "\\n"; break;
+        case '\r': escaped << "\\r"; break;
+        case '\t': escaped << "\\t"; break;
+        default:
+            if (c < 0x20) {
+                escaped << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(c) << std::dec;
+            } else {
+                escaped << static_cast<char>(c);
+            }
+        }
+    }
+    return escaped.str();
+}
+
+void Lcc2Writer::write_bbox(std::ostream& stream, const BBox& bbox, int indent) {
+    const std::string pad(static_cast<size_t>(indent), '\t');
+    stream << "{\n"
+           << pad << "\t\"min\": [" << bbox.min.x << ", " << bbox.min.y << ", " << bbox.min.z << "],\n"
+           << pad << "\t\"max\": [" << bbox.max.x << ", " << bbox.max.y << ", " << bbox.max.z << "]\n"
+           << pad << "}";
+}
+
+void Lcc2Writer::write(const SpatialGrid& grid,
+                       const std::vector<fs::path>& lod_files,
+                       const std::vector<fs::path>& payload_files,
+                       const fs::path& environment_file,
+                       const std::string& name,
+                       const std::vector<float>& lod_errors) {
+    if (lod_files.empty()) {
+        throw std::runtime_error("LCC2 output requires at least one 3DGS PLY file");
+    }
+
+    const std::vector<fs::path>& payloads = payload_files.empty() ? lod_files : payload_files;
+    if (payloads.size() != lod_files.size()) {
+        throw std::runtime_error("LCC2 payload count must match the number of LOD files");
+    }
+    if (!lod_errors.empty() && lod_errors.size() != lod_files.size()) {
+        throw std::runtime_error("LOD error count must match the number of LOD files");
+    }
+
+    const std::string splat_extension = lowercase_extension(payloads.front());
+    if (splat_extension != ".ply" && splat_extension != ".spz") {
+        throw std::runtime_error("Unsupported LCC2 splat payload type: " + splat_extension);
+    }
+    for (const auto& payload : payloads) {
+        if (lowercase_extension(payload) != splat_extension) {
+            throw std::runtime_error("All LCC2 LOD payloads must use the same file type");
+        }
+    }
+    if (!environment_file.empty() && splat_extension != ".ply") {
+        throw std::runtime_error("An environment PLY cannot be mixed with SPZ LCC2 payloads");
+    }
+
+    const fs::path splat_dir = output_dir_ / "data" / "3dgs";
+    fs::create_directories(splat_dir);
+
+    std::vector<size_t> lod_counts;
+    std::vector<std::string> relative_files;
+    lod_counts.reserve(lod_files.size());
+    relative_files.reserve(lod_files.size() + 1);
+
+    size_t total_splats = 0;
+    for (size_t lod = 0; lod < lod_files.size(); ++lod) {
+        SplatBuffer splats;
+        if (!splats.initialize(lod_files[lod])) {
+            throw std::runtime_error("Failed to inspect " + lod_files[lod].u8string() + ": " + splats.error());
+        }
+
+        if (splat_extension == ".spz") {
+            validate_spz_v4(payloads[lod], splats.size(), splats.sh_degree());
+        }
+
+        const std::string filename = "lod_" + std::to_string(lod) + splat_extension;
+        fs::copy_file(payloads[lod], splat_dir / filename, fs::copy_options::overwrite_existing);
+        relative_files.push_back("data/3dgs/" + filename);
+        lod_counts.push_back(splats.size());
+        total_splats += splats.size();
+    }
+
+    bool has_environment = !environment_file.empty() && fs::exists(environment_file);
+    size_t environment_count = 0;
+    BBox environment_bbox;
+    size_t environment_file_index = 0;
+    if (has_environment) {
+        SplatBuffer environment;
+        if (!environment.initialize(environment_file)) {
+            throw std::runtime_error("Failed to inspect " + environment_file.u8string() + ": " + environment.error());
+        }
+        environment_count = environment.size();
+        environment_bbox = environment.compute_bbox();
+        environment_file_index = relative_files.size();
+        fs::copy_file(environment_file, splat_dir / "environment.ply", fs::copy_options::overwrite_existing);
+        relative_files.push_back("data/3dgs/environment.ply");
+    }
+
+    auto metadata = platform::ofstream_open(output_dir_ / "meta.lcc2", std::ios::out);
+    if (!metadata) {
+        throw std::runtime_error("Failed to create meta.lcc2");
+    }
+    metadata << std::setprecision(15);
+
+    metadata << "{\n"
+             << "\t\"version\": \"0.0.3\",\n"
+             << "\t\"name\": \"" << json_escape(name) << "\",\n"
+             << "\t\"description\": \"Converted from PLY by ply2lcc; LCC2 data organization format originated from XGRIDS\",\n"
+             << "\t\"epsg\": 0,\n"
+             << "\t\"guid\": \"" << generate_guid() << "\",\n"
+             << "\t\"source\": \"ply2lcc\",\n"
+             << "\t\"dataType\": \"3DGS\",\n"
+             << "\t\"offset\": [0, 0, 0],\n"
+             << "\t\"shift\": [0, 0, 0],\n"
+             << "\t\"scale\": [1, 1, 1],\n"
+             << "\t\"fileType\": \"" << (grid.has_sh() ? "quality" : "portable") << "\",\n"
+             << "\t\"totalSplats\": " << total_splats << ",\n"
+             << "\t\"lodSplats\": [";
+    for (size_t i = 0; i < lod_counts.size(); ++i) {
+        if (i != 0) metadata << ", ";
+        metadata << lod_counts[i];
+    }
+    metadata << "],\n"
+             << "\t\"totalLevels\": " << lod_counts.size() << ",\n"
+             << "\t\"virtualLoD\": null,\n";
+    if (!lod_errors.empty()) {
+        metadata << "\t\"lodErrors\": [";
+        for (size_t i = 0; i < lod_errors.size(); ++i) {
+            if (i != 0) metadata << ", ";
+            metadata << lod_errors[i];
+        }
+        metadata << "],\n";
+    }
+    metadata
+             << "\t\"splatType\": \"" << splat_extension << "\",\n";
+
+    if (has_environment) {
+        metadata << "\t\"env\": {\n"
+                 << "\t\t\"type\": \"splats\",\n"
+                 << "\t\t\"splatsCount\": " << environment_count << ",\n"
+                 << "\t\t\"boundingBox\": ";
+        write_bbox(metadata, environment_bbox, 2);
+        metadata << "\n\t},\n";
+    } else {
+        metadata << "\t\"env\": null,\n";
+    }
+
+    metadata << "\t\"splatExtraAttributes\": null,\n"
+             << "\t\"root\": {\n"
+             << "\t\t\"id\": \"0\",\n"
+             << "\t\t\"boundingBox\": ";
+    write_bbox(metadata, grid.bbox(), 2);
+    metadata << ",\n"
+             << "\t\t\"childNum\": " << (lod_errors.empty() ? lod_files.size() : grid.cells().size()) << ",\n"
+             << "\t\t\"data\": ";
+    if (has_environment) {
+        metadata << "{\"env\": {\"name\": " << environment_file_index << "}}";
+    } else {
+        metadata << "null";
+    }
+    metadata << ",\n"
+             << "\t\t\"splatFiles\": [";
+    for (size_t i = 0; i < relative_files.size(); ++i) {
+        if (i != 0) metadata << ", ";
+        metadata << "\"" << json_escape(relative_files[i]) << "\"";
+    }
+    metadata << "],\n"
+             << "\t\t\"child\": {\n";
+
+    if (lod_errors.empty()) {
+        for (size_t lod = 0; lod < lod_files.size(); ++lod) {
+            metadata << "\t\t\t\"" << lod << "\": {\n"
+                     << "\t\t\t\t\"id\": \"0-" << lod << "\",\n"
+                     << "\t\t\t\t\"boundingBox\": ";
+            write_bbox(metadata, grid.bbox(), 4);
+            metadata << ",\n"
+                     << "\t\t\t\t\"childNum\": 0,\n"
+                     << "\t\t\t\t\"data\": {\"3dgs\": {\"name\": " << lod
+                     << ", \"start\": 0, \"count\": " << lod_counts[lod] << "}}\n"
+                     << "\t\t\t}" << (lod + 1 == lod_files.size() ? "\n" : ",\n");
+        }
+    } else {
+        size_t cell_number = 0;
+        for (const auto& cell_pair : grid.cells()) {
+            const uint32_t cell_id = cell_pair.first;
+            const GridCell& cell = cell_pair.second;
+            const uint32_t cell_x = cell_id & 0xffffU;
+            const uint32_t cell_y = cell_id >> 16;
+            BBox cell_bbox;
+            cell_bbox.min = Vec3f(grid.bbox().min.x + cell_x * grid.cell_size_x(),
+                                  grid.bbox().min.y + cell_y * grid.cell_size_y(), grid.bbox().min.z);
+            cell_bbox.max = Vec3f(std::min(grid.bbox().max.x, cell_bbox.min.x + grid.cell_size_x()),
+                                  std::min(grid.bbox().max.y, cell_bbox.min.y + grid.cell_size_y()), grid.bbox().max.z);
+            std::vector<size_t> present;
+            for (size_t lod = 0; lod < lod_files.size(); ++lod) {
+                if (!cell.splat_indices[lod].empty()) present.push_back(lod);
+            }
+            metadata << "\t\t\t\"" << cell_number << "\": {\n"
+                     << "\t\t\t\t\"id\": \"cell-" << cell_id << "\",\n"
+                     << "\t\t\t\t\"boundingBox\": ";
+            write_bbox(metadata, cell_bbox, 4);
+            metadata << ",\n\t\t\t\t\"childNum\": " << (present.empty() ? 0 : 1)
+                     << ",\n\t\t\t\t\"data\": null,\n\t\t\t\t\"child\": ";
+            if (present.empty()) {
+                metadata << "{}\n";
+            } else {
+                metadata << "{\n";
+                for (size_t depth = 0; depth < present.size(); ++depth) {
+                    const size_t lod = present[depth];
+                    const auto& indices = cell.splat_indices[lod];
+                    for (size_t i = 1; i < indices.size(); ++i) {
+                        if (indices[i] != indices[i - 1] + 1) {
+                            throw std::runtime_error("Generated LOD payload is not contiguous within spatial cell");
+                        }
+                    }
+                    const std::string pad(5 + depth, '\t');
+                    metadata << pad << "\"" << lod << "\": {\n"
+                             << pad << "\t\"id\": \"cell-" << cell_id << "-lod-" << lod << "\",\n"
+                             << pad << "\t\"boundingBox\": ";
+                    write_bbox(metadata, cell_bbox, 6 + static_cast<int>(depth));
+                    metadata << ",\n" << pad << "\t\"lodLevel\": " << lod
+                             << ",\n" << pad << "\t\"lodError\": " << lod_errors[lod]
+                             << ",\n" << pad << "\t\"childNum\": " << (depth + 1 < present.size() ? 1 : 0)
+                             << ",\n" << pad << "\t\"data\": {\"3dgs\": {\"name\": " << lod
+                             << ", \"start\": " << indices.front() << ", \"count\": " << indices.size() << "}}";
+                    if (depth + 1 < present.size()) metadata << ",\n" << pad << "\t\"child\": {\n";
+                    else metadata << "\n";
+                }
+                for (size_t depth = present.size(); depth-- > 0;) {
+                    const std::string pad(5 + depth, '\t');
+                    metadata << pad << "}";
+                    if (depth > 0) metadata << "\n" << std::string(5 + depth - 1, '\t') << "}\n";
+                    else metadata << "\n\t\t\t\t}\n";
+                }
+            }
+            metadata << "\t\t\t}" << (++cell_number == grid.cells().size() ? "\n" : ",\n");
+        }
+    }
+
+    metadata << "\t\t}\n"
+             << "\t},\n"
+             << "\t\"renderingHints\": {\n"
+             << "\t\t\"renderMethod\": \"splatting\",\n"
+             << "\t\t\"renderMethodVariant\": \"ewa\",\n"
+             << "\t\t\"sortingMethod\": \"depth\",\n"
+             << "\t\t\"cameraModel\": \"pinhole\"\n"
+             << "\t}\n"
+             << "}\n";
+
+    if (!metadata) {
+        throw std::runtime_error("Failed while writing meta.lcc2");
+    }
+
+    auto notice = platform::ofstream_open(output_dir_ / "LCC2-NOTICE.md", std::ios::out);
+    if (!notice) {
+        throw std::runtime_error("Failed to create LCC2-NOTICE.md");
+    }
+    notice
+        << "# LCC2 format notice\n\n"
+        << "The LCC2 data organization format originated from XGRIDS.\n\n"
+        << "This package was created by the independent ply2lcc implementation and "
+           "is not an official XGRIDS implementation. It modifies the organization "
+           "described by the whitepaper by mapping supplied levels into spatial nodes "
+           "beneath the root.\n\n"
+        << "Specification and license: https://github.com/xgrids/LCC2Whitepaper\n\n"
+        << "Use and redistribution of this package are subject to the terms in that whitepaper.\n";
+    if (!notice) {
+        throw std::runtime_error("Failed while writing LCC2-NOTICE.md");
+    }
+}
+
+} // namespace ply2lcc

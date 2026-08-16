@@ -1,0 +1,459 @@
+#include "lod_generator.hpp"
+#include "platform.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <numeric>
+#include <sstream>
+#include <stdexcept>
+
+namespace fs = std::filesystem;
+
+namespace ply2lcc {
+namespace {
+
+constexpr double kEpsilon = 1e-8;
+constexpr float kShC0 = 0.28209479177387814f;
+constexpr float kColourThreshold = 0.30f;
+constexpr float kSpatialThresholdFactor = 2.5f;
+
+struct Mat3 {
+    double v[3][3]{};
+};
+
+struct OrderedSplat {
+    uint64_t morton;
+    size_t index;
+};
+
+double sqr(double value) { return value * value; }
+
+Vec3f rgb(const Splat& splat) {
+    return Vec3f(clamp(0.5f + kShC0 * splat.f_dc[0], 0.0f, 1.0f),
+                 clamp(0.5f + kShC0 * splat.f_dc[1], 0.0f, 1.0f),
+                 clamp(0.5f + kShC0 * splat.f_dc[2], 0.0f, 1.0f));
+}
+
+float colour_distance(const Vec3f& a, const Vec3f& b) {
+    return std::sqrt(static_cast<float>(sqr(a.x - b.x) + sqr(a.y - b.y) + sqr(a.z - b.z)));
+}
+
+float max_scale(const Splat& splat) {
+    return std::max({std::exp(splat.scale.x), std::exp(splat.scale.y), std::exp(splat.scale.z)});
+}
+
+double importance(const Splat& splat) {
+    const double sx = std::exp(splat.scale.x);
+    const double sy = std::exp(splat.scale.y);
+    const double sz = std::exp(splat.scale.z);
+    const double area = std::max({sx * sy, sx * sz, sy * sz});
+    return std::max(kEpsilon, static_cast<double>(sigmoid(splat.opacity)) * area);
+}
+
+Mat3 covariance(const Splat& splat) {
+    double w = splat.rot[0], x = splat.rot[1], y = splat.rot[2], z = splat.rot[3];
+    const double norm = std::sqrt(w * w + x * x + y * y + z * z);
+    if (norm > kEpsilon) {
+        w /= norm; x /= norm; y /= norm; z /= norm;
+    } else {
+        w = 1.0; x = y = z = 0.0;
+    }
+    const double r[3][3] = {
+        {1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)},
+        {2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)},
+        {2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)}
+    };
+    const double d[3] = {sqr(std::exp(splat.scale.x)),
+                         sqr(std::exp(splat.scale.y)),
+                         sqr(std::exp(splat.scale.z))};
+    Mat3 result;
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            for (int axis = 0; axis < 3; ++axis) {
+                result.v[row][col] += r[row][axis] * d[axis] * r[col][axis];
+            }
+        }
+    }
+    return result;
+}
+
+void eigen_symmetric(Mat3 matrix, double values[3], Mat3& vectors) {
+    for (int i = 0; i < 3; ++i) vectors.v[i][i] = 1.0;
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        int p = 0, q = 1;
+        double largest = std::abs(matrix.v[0][1]);
+        for (int i = 0; i < 3; ++i) {
+            for (int j = i + 1; j < 3; ++j) {
+                if (std::abs(matrix.v[i][j]) > largest) {
+                    largest = std::abs(matrix.v[i][j]); p = i; q = j;
+                }
+            }
+        }
+        if (largest < 1e-12) break;
+        const double angle = 0.5 * std::atan2(2.0 * matrix.v[p][q],
+                                              matrix.v[q][q] - matrix.v[p][p]);
+        const double c = std::cos(angle), s = std::sin(angle);
+        for (int k = 0; k < 3; ++k) {
+            const double mkp = matrix.v[k][p], mkq = matrix.v[k][q];
+            matrix.v[k][p] = c * mkp - s * mkq;
+            matrix.v[k][q] = s * mkp + c * mkq;
+        }
+        for (int k = 0; k < 3; ++k) {
+            const double mpk = matrix.v[p][k], mqk = matrix.v[q][k];
+            matrix.v[p][k] = c * mpk - s * mqk;
+            matrix.v[q][k] = s * mpk + c * mqk;
+        }
+        matrix.v[p][q] = matrix.v[q][p] = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            const double vkp = vectors.v[k][p], vkq = vectors.v[k][q];
+            vectors.v[k][p] = c * vkp - s * vkq;
+            vectors.v[k][q] = s * vkp + c * vkq;
+        }
+    }
+    for (int i = 0; i < 3; ++i) values[i] = std::max(kEpsilon, matrix.v[i][i]);
+
+    std::array<int, 3> order{0, 1, 2};
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return values[a] > values[b]; });
+    double sorted_values[3];
+    Mat3 sorted_vectors;
+    for (int col = 0; col < 3; ++col) {
+        sorted_values[col] = values[order[col]];
+        for (int row = 0; row < 3; ++row) sorted_vectors.v[row][col] = vectors.v[row][order[col]];
+    }
+    std::copy(sorted_values, sorted_values + 3, values);
+    vectors = sorted_vectors;
+
+    const double det =
+        vectors.v[0][0] * (vectors.v[1][1] * vectors.v[2][2] - vectors.v[1][2] * vectors.v[2][1]) -
+        vectors.v[0][1] * (vectors.v[1][0] * vectors.v[2][2] - vectors.v[1][2] * vectors.v[2][0]) +
+        vectors.v[0][2] * (vectors.v[1][0] * vectors.v[2][1] - vectors.v[1][1] * vectors.v[2][0]);
+    if (det < 0.0) for (int row = 0; row < 3; ++row) vectors.v[row][2] = -vectors.v[row][2];
+}
+
+Quat matrix_to_quaternion(const Mat3& m) {
+    Quat q;
+    const double trace = m.v[0][0] + m.v[1][1] + m.v[2][2];
+    if (trace > 0.0) {
+        const double s = std::sqrt(trace + 1.0) * 2.0;
+        q.w = static_cast<float>(0.25 * s);
+        q.x = static_cast<float>((m.v[2][1] - m.v[1][2]) / s);
+        q.y = static_cast<float>((m.v[0][2] - m.v[2][0]) / s);
+        q.z = static_cast<float>((m.v[1][0] - m.v[0][1]) / s);
+    } else {
+        int i = 0;
+        if (m.v[1][1] > m.v[0][0]) i = 1;
+        if (m.v[2][2] > m.v[i][i]) i = 2;
+        const int j = (i + 1) % 3, k = (i + 2) % 3;
+        const double s = std::sqrt(std::max(kEpsilon, 1.0 + m.v[i][i] - m.v[j][j] - m.v[k][k])) * 2.0;
+        double components[4]{};
+        components[i + 1] = 0.25 * s;
+        components[0] = (m.v[k][j] - m.v[j][k]) / s;
+        components[j + 1] = (m.v[j][i] + m.v[i][j]) / s;
+        components[k + 1] = (m.v[k][i] + m.v[i][k]) / s;
+        q = Quat(static_cast<float>(components[0]), static_cast<float>(components[1]),
+                 static_cast<float>(components[2]), static_cast<float>(components[3]));
+    }
+    const float norm = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (norm > 0.0f) { q.w /= norm; q.x /= norm; q.y /= norm; q.z /= norm; }
+    return q;
+}
+
+uint64_t expand_bits(uint32_t value) {
+    uint64_t x = value & 0x1fffffU;
+    x = (x | x << 32) & 0x1f00000000ffffULL;
+    x = (x | x << 16) & 0x1f0000ff0000ffULL;
+    x = (x | x << 8) & 0x100f00f00f00f00fULL;
+    x = (x | x << 4) & 0x10c30c30c30c30c3ULL;
+    x = (x | x << 2) & 0x1249249249249249ULL;
+    return x;
+}
+
+std::vector<OrderedSplat> morton_order(const std::vector<Splat>& splats) {
+    BBox bounds;
+    for (const Splat& splat : splats) bounds.expand(splat.pos);
+    const double extent[3] = {std::max(kEpsilon, static_cast<double>(bounds.max.x - bounds.min.x)),
+                              std::max(kEpsilon, static_cast<double>(bounds.max.y - bounds.min.y)),
+                              std::max(kEpsilon, static_cast<double>(bounds.max.z - bounds.min.z))};
+    std::vector<OrderedSplat> result;
+    result.reserve(splats.size());
+    for (size_t i = 0; i < splats.size(); ++i) {
+        uint32_t q[3];
+        for (int axis = 0; axis < 3; ++axis) {
+            const double normalized = clamp(static_cast<float>((splats[i].pos[axis] - bounds.min[axis]) / extent[axis]), 0.0f, 1.0f);
+            q[axis] = static_cast<uint32_t>(normalized * 2097151.0);
+        }
+        result.push_back({expand_bits(q[0]) | (expand_bits(q[1]) << 1) | (expand_bits(q[2]) << 2), i});
+    }
+    std::stable_sort(result.begin(), result.end(), [](const OrderedSplat& a, const OrderedSplat& b) {
+        return a.morton < b.morton || (a.morton == b.morton && a.index < b.index);
+    });
+    return result;
+}
+
+float point_distance(const Vec3f& a, const Vec3f& b) {
+    return std::sqrt(static_cast<float>(sqr(a.x - b.x) + sqr(a.y - b.y) + sqr(a.z - b.z)));
+}
+
+float logit(float alpha) {
+    alpha = clamp(alpha, 1e-6f, 1.0f - 1e-6f);
+    return std::log(alpha / (1.0f - alpha));
+}
+
+} // namespace
+
+LodGenerator::LodGenerator(LodSettings settings) : settings_(settings) {
+    if (settings_.levels < 2) throw std::runtime_error("--lod-levels must be at least 2");
+    if (settings_.levels > 32) throw std::runtime_error("--lod-levels must not exceed 32");
+    if (settings_.reduction < 2) throw std::runtime_error("--lod-reduction must be at least 2");
+    if (settings_.reduction > 1024) throw std::runtime_error("--lod-reduction must not exceed 1024");
+}
+
+std::vector<LodLevel> LodGenerator::generate(std::vector<Splat> source) const {
+    if (source.empty()) throw std::runtime_error("Cannot generate LODs from an empty scene");
+    validate(source, "source LOD");
+    std::vector<LodLevel> fine_to_coarse;
+    LodLevel original;
+    original.splats = std::move(source);
+    original.stats.input_count = original.splats.size();
+    original.stats.output_count = original.splats.size();
+    fine_to_coarse.push_back(std::move(original));
+    while (fine_to_coarse.size() < settings_.levels && fine_to_coarse.back().splats.size() > 1) {
+        LodLevel next = settings_.method == LodMethod::Decimate
+            ? decimate(fine_to_coarse.back().splats)
+            : cluster(fine_to_coarse.back().splats);
+        if (next.splats.size() >= fine_to_coarse.back().splats.size()) {
+            break;
+        }
+        validate(next.splats, "generated LOD");
+        next.error += fine_to_coarse.back().error;
+        fine_to_coarse.push_back(std::move(next));
+    }
+    std::reverse(fine_to_coarse.begin(), fine_to_coarse.end());
+    return fine_to_coarse;
+}
+
+LodLevel LodGenerator::decimate(const std::vector<Splat>& source) const {
+    LodLevel level;
+    level.stats.input_count = source.size();
+    const size_t target = std::max<size_t>(1, (source.size() + settings_.reduction - 1) / settings_.reduction);
+    const auto ordered = morton_order(source);
+    level.splats.reserve(target);
+    double error_sum = 0.0;
+    for (size_t bucket = 0; bucket < target; ++bucket) {
+        const size_t begin = bucket * ordered.size() / target;
+        const size_t end = (bucket + 1) * ordered.size() / target;
+        size_t best = ordered[begin].index;
+        double best_importance = importance(source[best]);
+        for (size_t i = begin + 1; i < end; ++i) {
+            const size_t candidate = ordered[i].index;
+            const double score = importance(source[candidate]);
+            if (score > best_importance) { best = candidate; best_importance = score; }
+        }
+        level.splats.push_back(source[best]);
+        float bucket_error = 0.0f;
+        for (size_t i = begin; i < end; ++i) {
+            const Splat& item = source[ordered[i].index];
+            bucket_error = std::max(bucket_error, point_distance(item.pos, source[best].pos) +
+                                    std::abs(max_scale(item) - max_scale(source[best])));
+        }
+        level.error = std::max(level.error, bucket_error);
+        error_sum += bucket_error;
+    }
+    level.stats.output_count = level.splats.size();
+    level.stats.cluster_count = target;
+    level.stats.min_cluster_size = source.size() / target;
+    level.stats.max_cluster_size = (source.size() + target - 1) / target;
+    level.stats.average_cluster_size = static_cast<double>(source.size()) / target;
+    level.stats.mean_covariance_error = error_sum / target;
+    level.stats.max_error = level.error;
+    return level;
+}
+
+LodLevel LodGenerator::cluster(const std::vector<Splat>& source) const {
+    LodLevel level;
+    level.stats.input_count = source.size();
+    const auto ordered = morton_order(source);
+    const size_t block_size = settings_.reduction;
+    BBox bounds;
+    double mean_radius = 0.0;
+    for (const Splat& splat : source) {
+        bounds.expand(splat.pos);
+        mean_radius += max_scale(splat);
+    }
+    mean_radius /= source.size();
+    const float diagonal = point_distance(bounds.min, bounds.max);
+    const float target_clusters = static_cast<float>(std::max<size_t>(1, source.size() / settings_.reduction));
+    const float distribution_threshold = kSpatialThresholdFactor * diagonal / std::cbrt(target_clusters);
+    const float spatial_threshold = std::max(0.05f,
+        std::min(distribution_threshold, static_cast<float>(8.0 * mean_radius)));
+    level.stats.min_cluster_size = std::numeric_limits<size_t>::max();
+    double error_sum = 0.0;
+    for (size_t begin = 0; begin < ordered.size(); begin += block_size) {
+        const size_t end = std::min(ordered.size(), begin + block_size);
+        std::vector<std::vector<size_t>> groups;
+        std::vector<Vec3f> group_colours;
+        std::vector<Vec3f> group_positions;
+        for (size_t i = begin; i < end; ++i) {
+            const size_t index = ordered[i].index;
+            const Vec3f colour = rgb(source[index]);
+            size_t best_group = groups.size();
+            float best_cost = std::numeric_limits<float>::max();
+            for (size_t group = 0; group < groups.size(); ++group) {
+                const float colour_delta = colour_distance(colour, group_colours[group]);
+                const float position_delta = point_distance(source[index].pos, group_positions[group]);
+                if (colour_delta <= kColourThreshold && position_delta <= spatial_threshold) {
+                    const float cost = colour_delta / kColourThreshold + position_delta / spatial_threshold;
+                    if (cost < best_cost) { best_cost = cost; best_group = group; }
+                }
+            }
+            if (best_group == groups.size()) {
+                if (!groups.empty()) ++level.stats.rejected_merges;
+                groups.push_back({index});
+                group_colours.push_back(colour);
+                group_positions.push_back(source[index].pos);
+            } else {
+                auto& members = groups[best_group];
+                const float n = static_cast<float>(members.size());
+                group_colours[best_group] = Vec3f((group_colours[best_group].x * n + colour.x) / (n + 1.0f),
+                                                  (group_colours[best_group].y * n + colour.y) / (n + 1.0f),
+                                                  (group_colours[best_group].z * n + colour.z) / (n + 1.0f));
+                group_positions[best_group] = Vec3f((group_positions[best_group].x * n + source[index].pos.x) / (n + 1.0f),
+                                                    (group_positions[best_group].y * n + source[index].pos.y) / (n + 1.0f),
+                                                    (group_positions[best_group].z * n + source[index].pos.z) / (n + 1.0f));
+                members.push_back(index);
+            }
+        }
+        for (const auto& group : groups) {
+            float error = 0.0f;
+            level.splats.push_back(merge_cluster(source, group, &error));
+            level.error = std::max(level.error, error);
+            error_sum += error;
+            level.stats.min_cluster_size = std::min(level.stats.min_cluster_size, group.size());
+            level.stats.max_cluster_size = std::max(level.stats.max_cluster_size, group.size());
+        }
+    }
+    level.stats.output_count = level.splats.size();
+    level.stats.cluster_count = level.splats.size();
+    if (level.splats.empty()) level.stats.min_cluster_size = 0;
+    level.stats.average_cluster_size = static_cast<double>(source.size()) / std::max<size_t>(1, level.splats.size());
+    level.stats.mean_covariance_error = error_sum / std::max<size_t>(1, level.splats.size());
+    level.stats.max_error = level.error;
+    return level;
+}
+
+Splat LodGenerator::merge_cluster(const std::vector<Splat>& splats,
+                                  const std::vector<size_t>& indices,
+                                  float* error) {
+    if (indices.empty()) throw std::runtime_error("Cannot merge an empty Gaussian cluster");
+    Splat result{};
+    double total_weight = 0.0, alpha_product = 1.0;
+    Vec3f colour_sum;
+    for (size_t index : indices) {
+        if (index >= splats.size()) throw std::runtime_error("Invalid Gaussian cluster index");
+        const Splat& splat = splats[index];
+        const double weight = importance(splat);
+        total_weight += weight;
+        result.pos.x += static_cast<float>(weight * splat.pos.x);
+        result.pos.y += static_cast<float>(weight * splat.pos.y);
+        result.pos.z += static_cast<float>(weight * splat.pos.z);
+        const Vec3f colour = rgb(splat);
+        colour_sum.x += static_cast<float>(weight * colour.x);
+        colour_sum.y += static_cast<float>(weight * colour.y);
+        colour_sum.z += static_cast<float>(weight * colour.z);
+        alpha_product *= 1.0 - sigmoid(splat.opacity);
+    }
+    result.pos.x = static_cast<float>(result.pos.x / total_weight);
+    result.pos.y = static_cast<float>(result.pos.y / total_weight);
+    result.pos.z = static_cast<float>(result.pos.z / total_weight);
+    const Vec3f merged_colour(colour_sum.x / static_cast<float>(total_weight),
+                              colour_sum.y / static_cast<float>(total_weight),
+                              colour_sum.z / static_cast<float>(total_weight));
+    result.f_dc[0] = (clamp(merged_colour.x, 0.0f, 1.0f) - 0.5f) / kShC0;
+    result.f_dc[1] = (clamp(merged_colour.y, 0.0f, 1.0f) - 0.5f) / kShC0;
+    result.f_dc[2] = (clamp(merged_colour.z, 0.0f, 1.0f) - 0.5f) / kShC0;
+    result.opacity = logit(static_cast<float>(1.0 - alpha_product));
+
+    Mat3 merged;
+    for (size_t index : indices) {
+        const Splat& splat = splats[index];
+        const double weight = importance(splat);
+        const Mat3 own = covariance(splat);
+        const double delta[3] = {splat.pos.x - result.pos.x, splat.pos.y - result.pos.y, splat.pos.z - result.pos.z};
+        for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+                merged.v[row][col] += weight * (own.v[row][col] + delta[row] * delta[col]) / total_weight;
+            }
+        }
+    }
+    double eigenvalues[3];
+    Mat3 eigenvectors;
+    eigen_symmetric(merged, eigenvalues, eigenvectors);
+    result.scale = Vec3f(static_cast<float>(std::log(std::sqrt(eigenvalues[0]))),
+                         static_cast<float>(std::log(std::sqrt(eigenvalues[1]))),
+                         static_cast<float>(std::log(std::sqrt(eigenvalues[2]))));
+    const Quat rotation = matrix_to_quaternion(eigenvectors);
+    result.rot[0] = rotation.w; result.rot[1] = rotation.x;
+    result.rot[2] = rotation.y; result.rot[3] = rotation.z;
+
+    float max_error = 0.0f;
+    for (size_t index : indices) {
+        max_error = std::max(max_error, point_distance(splats[index].pos, result.pos) +
+                             std::abs(max_scale(splats[index]) - max_scale(result)));
+    }
+    if (error) *error = max_error;
+    return result;
+}
+
+void LodGenerator::validate(const std::vector<Splat>& splats, const std::string& label) {
+    for (size_t i = 0; i < splats.size(); ++i) {
+        const Splat& s = splats[i];
+        auto finite = [](float value) { return std::isfinite(value); };
+        const float alpha = sigmoid(s.opacity);
+        const float sx = std::exp(s.scale.x), sy = std::exp(s.scale.y), sz = std::exp(s.scale.z);
+        const float qnorm = std::sqrt(s.rot[0] * s.rot[0] + s.rot[1] * s.rot[1] +
+                                      s.rot[2] * s.rot[2] + s.rot[3] * s.rot[3]);
+        const Vec3f colour = rgb(s);
+        if (!finite(s.pos.x) || !finite(s.pos.y) || !finite(s.pos.z) ||
+            !finite(s.scale.x) || !finite(s.scale.y) || !finite(s.scale.z) ||
+            !finite(sx) || !finite(sy) || !finite(sz) || sx <= 0.0f || sy <= 0.0f || sz <= 0.0f ||
+            !finite(s.opacity) || !(alpha >= 0.0f && alpha <= 1.0f) ||
+            !finite(qnorm) || std::abs(qnorm - 1.0f) > 1e-3f ||
+            !(colour.x >= 0.0f && colour.x <= 1.0f && colour.y >= 0.0f && colour.y <= 1.0f &&
+              colour.z >= 0.0f && colour.z <= 1.0f)) {
+            throw std::runtime_error(label + " contains invalid Gaussian at index " + std::to_string(i));
+        }
+    }
+}
+
+void LodGenerator::write_binary_ply(const fs::path& path, const std::vector<Splat>& splats,
+                                    int num_f_rest) {
+    num_f_rest = std::max(0, std::min(num_f_rest, 45));
+    auto file = platform::ofstream_open(path, std::ios::out | std::ios::binary);
+    if (!file) throw std::runtime_error("Failed to create generated LOD: " + path.u8string());
+    file << "ply\nformat binary_little_endian 1.0\n"
+         << "comment generated by ply2lcc offline LOD generator\n"
+         << "element vertex " << splats.size() << "\n"
+         << "property float x\nproperty float y\nproperty float z\n"
+         << "property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n";
+    for (int i = 0; i < num_f_rest; ++i) file << "property float f_rest_" << i << "\n";
+    file << "property float opacity\n"
+         << "property float scale_0\nproperty float scale_1\nproperty float scale_2\n"
+         << "property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n"
+         << "end_header\n";
+    for (const Splat& s : splats) {
+        const float prefix[6] = {s.pos.x, s.pos.y, s.pos.z, s.f_dc[0], s.f_dc[1], s.f_dc[2]};
+        const float suffix[8] = {s.opacity, s.scale.x, s.scale.y, s.scale.z,
+                                 s.rot[0], s.rot[1], s.rot[2], s.rot[3]};
+        file.write(reinterpret_cast<const char*>(prefix), sizeof(prefix));
+        file.write(reinterpret_cast<const char*>(s.f_rest),
+                   static_cast<std::streamsize>(num_f_rest * sizeof(float)));
+        file.write(reinterpret_cast<const char*>(suffix), sizeof(suffix));
+    }
+    if (!file) throw std::runtime_error("Failed while writing generated LOD: " + path.u8string());
+}
+
+} // namespace ply2lcc
