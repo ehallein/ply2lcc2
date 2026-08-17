@@ -117,6 +117,9 @@ void ConvertApp::run() {
         Lcc2Writer writer(output_dir_, splat_transform_path_);
         writer.write(grid, lod_files_, lcc2_payload_files_, env_file_, base_name_, lod_errors_,
                      has_generated_hierarchy_ ? &hierarchy_ : nullptr);
+        if (has_generated_hierarchy_) {
+            log("Hierarchy validation: payload ranges, bounds, and monotonic errors passed\n");
+        }
         if (!generated_lod_dir_.empty()) {
             fs::remove_all(generated_lod_dir_);
         }
@@ -195,7 +198,10 @@ void ConvertApp::printUsage() {
               << "  --lod-reduction N  Approximate reduction per level (default: 4)\n"
               << "  --lod-method M     cluster (default) or decimate\n"
               << "  --lod-debug        Print detailed LOD generation statistics\n"
-              << "  --max-leaf-splats N Maximum full-detail splats per adaptive leaf (default: 65536)\n"
+              << "  --max-leaf-splats N Maximum full-detail splats per spatial leaf (default: 8192)\n"
+              << "  --max-refinement-cost N Maximum child-minus-parent splat jump (default: 20000)\n"
+              << "  --max-node-diagonal D Split spatial leaves above this source-space diagonal (0 disables)\n"
+              << "  --min-split-splats N Minimum splats for extent-driven splitting (default: 1024)\n"
               << "  --lcc2-payload-layout L level (default) or chunked\n"
               << "  --max-payload-splats N Maximum splats per chunked payload (default: 262144)\n"
               << "  --cell-size X,Y    Grid cell size in meters (default: 30,30)\n";
@@ -271,6 +277,19 @@ void ConvertApp::parseArgs() {
         } else if (arg == "--max-leaf-splats") {
             if (i + 1 >= argc_) throw std::runtime_error("Missing value for --max-leaf-splats");
             lod_settings_.max_leaf_splats = parse_count(argv_[++i], "--max-leaf-splats");
+        } else if (arg == "--max-refinement-cost") {
+            if (i + 1 >= argc_) throw std::runtime_error("Missing value for --max-refinement-cost");
+            lod_settings_.max_refinement_cost = parse_count(argv_[++i], "--max-refinement-cost");
+        } else if (arg == "--max-node-diagonal") {
+            if (i + 1 >= argc_) throw std::runtime_error("Missing value for --max-node-diagonal");
+            try {
+                lod_settings_.max_node_diagonal = std::stof(argv_[++i]);
+            } catch (const std::exception&) {
+                throw std::runtime_error("Invalid value for --max-node-diagonal: expected a non-negative number");
+            }
+        } else if (arg == "--min-split-splats") {
+            if (i + 1 >= argc_) throw std::runtime_error("Missing value for --min-split-splats");
+            lod_settings_.min_split_splats = parse_count(argv_[++i], "--min-split-splats");
         } else if (arg == "--lcc2-payload-layout") {
             if (i + 1 >= argc_) throw std::runtime_error("Missing value for --lcc2-payload-layout");
             const std::string layout = argv_[++i];
@@ -334,6 +353,15 @@ void ConvertApp::parseArgs() {
     }
     if (lod_settings_.max_payload_splats == 0 || lod_settings_.max_payload_splats > kMaximumConfiguredSplats) {
         throw std::runtime_error("--max-payload-splats must be between 1 and 16777216");
+    }
+    if (lod_settings_.max_refinement_cost > kMaximumConfiguredSplats) {
+        throw std::runtime_error("--max-refinement-cost must be between 0 and 16777216");
+    }
+    if (lod_settings_.min_split_splats == 0 || lod_settings_.min_split_splats > kMaximumConfiguredSplats) {
+        throw std::runtime_error("--min-split-splats must be between 1 and 16777216");
+    }
+    if (!std::isfinite(lod_settings_.max_node_diagonal) || lod_settings_.max_node_diagonal < 0.0f) {
+        throw std::runtime_error("--max-node-diagonal must be finite and non-negative");
     }
     if (lod_settings_.payload_layout == Lcc2PayloadLayout::Chunked && !lod_settings_.generate) {
         throw std::runtime_error("--lcc2-payload-layout chunked currently requires --generate-lod");
@@ -461,31 +489,38 @@ void ConvertApp::generateLods() {
 
     LodGenerator generator(lod_settings_);
     const std::vector<Splat> source_splats = source.to_vector();
-    AdaptiveLodHierarchy adaptive = generator.generate_adaptive(source_splats, lod_settings_.max_leaf_splats);
+    SpatialLodHierarchy spatial = generator.generate_spatial(source_splats);
     generated_lod_dir_ = output_dir_ / ".generated_lod";
     fs::create_directories(generated_lod_dir_);
     lod_files_.clear();
     lcc2_payload_files_.clear();
-    lod_errors_ = adaptive.errors_per_level;
+    lod_errors_ = spatial.errors_per_level;
     lod_stats_.clear();
     hierarchy_ = {};
-    hierarchy_.level_count = adaptive.level_count;
-    hierarchy_.splats_per_level = adaptive.splats_per_level;
-    hierarchy_.errors_per_level = adaptive.errors_per_level;
-    hierarchy_.bounds = adaptive.bounds;
-    hierarchy_.leaves.resize(adaptive.leaves.size());
+    hierarchy_.level_count = spatial.level_count;
+    hierarchy_.splats_per_level = spatial.splats_per_level;
+    hierarchy_.errors_per_level = spatial.errors_per_level;
+    hierarchy_.bounds = spatial.bounds;
+    hierarchy_.roots = spatial.roots;
+    hierarchy_.nodes.resize(spatial.nodes.size());
     has_generated_hierarchy_ = true;
 
     std::vector<size_t> leaf_sizes;
-    leaf_sizes.reserve(adaptive.leaves.size());
-    for (const AdaptiveLodLeaf& leaf : adaptive.leaves) {
-        if (leaf.source_indices.empty()) throw std::runtime_error("Adaptive partition produced an empty leaf");
-        if (leaf.source_indices.size() > lod_settings_.max_leaf_splats) {
-            throw std::runtime_error("Adaptive partition emitted a full-detail node above --max-leaf-splats");
+    for (const SpatialLodNode& node : spatial.nodes) {
+        Lcc2HierarchyNodeInfo& output = hierarchy_.nodes[node.id];
+        output.id = node.id;
+        output.level = node.level;
+        output.count = node.representation.splats.size();
+        output.error = node.representation.error;
+        output.bounds = node.bounds;
+        output.children = node.children;
+        if (node.level + 1 == spatial.level_count) {
+            if (node.source_indices.empty()) throw std::runtime_error("Spatial partition produced an empty leaf");
+            if (node.source_indices.size() > lod_settings_.max_leaf_splats) {
+                throw std::runtime_error("Spatial partition emitted a full-detail node above --max-leaf-splats");
+            }
+            leaf_sizes.push_back(node.source_indices.size());
         }
-        leaf_sizes.push_back(leaf.source_indices.size());
-        hierarchy_.leaves[leaf.id].id = leaf.id;
-        hierarchy_.leaves[leaf.id].bounds = leaf.bounds;
     }
     std::sort(leaf_sizes.begin(), leaf_sizes.end());
     log("  leaves: " + std::to_string(leaf_sizes.size()) +
@@ -494,34 +529,29 @@ void ConvertApp::generateLods() {
 
     size_t max_payload_count = 0;
     uintmax_t max_payload_bytes = 0;
-    for (size_t level = 0; level < adaptive.level_count; ++level) {
-        std::vector<size_t> present;
+    for (size_t level = 0; level < spatial.level_count; ++level) {
+        const std::vector<size_t>& present = spatial.nodes_per_level[level];
         std::vector<Splat> complete_level;
         size_t max_node_count = 0;
-        for (const AdaptiveLodLeaf& leaf : adaptive.leaves) {
-            const size_t first = adaptive.level_count - leaf.levels.size();
-            if (level < first) continue;
-            const LodLevel& node = leaf.levels[level - first];
-            present.push_back(leaf.id);
-            complete_level.insert(complete_level.end(), node.splats.begin(), node.splats.end());
-            max_node_count = std::max(max_node_count, node.splats.size());
+        for (size_t node_id : present) {
+            const LodLevel& representation = spatial.nodes[node_id].representation;
+            complete_level.insert(complete_level.end(), representation.splats.begin(), representation.splats.end());
+            max_node_count = std::max(max_node_count, representation.splats.size());
         }
         const fs::path complete_path = generated_lod_dir_ / ("lod_" + std::to_string(level) + ".ply");
         LodGenerator::write_binary_ply(complete_path, complete_level, source.num_f_rest());
         lod_files_.push_back(complete_path);
         log("  LOD" + std::to_string(level) + ": " + std::to_string(complete_level.size()) +
             " splats, " + std::to_string(present.size()) + " nodes, max node " +
-            std::to_string(max_node_count) + ", error " + std::to_string(adaptive.errors_per_level[level]) + "\n");
+            std::to_string(max_node_count) + ", error " + std::to_string(spatial.errors_per_level[level]) + "\n");
 
         std::vector<std::vector<size_t>> groups(1);
         size_t group_count = 0;
-        for (size_t leaf_id : present) {
-            const AdaptiveLodLeaf& leaf = adaptive.leaves[leaf_id];
-            const size_t first = adaptive.level_count - leaf.levels.size();
-            const size_t count = leaf.levels[level - first].splats.size();
+        for (size_t node_id : present) {
+            const size_t count = spatial.nodes[node_id].representation.splats.size();
             if (lod_settings_.payload_layout == Lcc2PayloadLayout::Chunked && count > lod_settings_.max_payload_splats) {
-                throw std::runtime_error("--max-payload-splats is smaller than node leaf-" +
-                                         std::to_string(leaf_id) + " at LOD" + std::to_string(level) +
+                throw std::runtime_error("--max-payload-splats is smaller than node " +
+                                         std::to_string(node_id) + " at LOD" + std::to_string(level) +
                                          "; nodes cannot be split across payloads");
             }
             if (lod_settings_.payload_layout == Lcc2PayloadLayout::Chunked && !groups.back().empty() &&
@@ -529,20 +559,20 @@ void ConvertApp::generateLods() {
                 groups.emplace_back();
                 group_count = 0;
             }
-            groups.back().push_back(leaf_id);
+            groups.back().push_back(node_id);
             group_count += count;
         }
 
         for (size_t chunk = 0; chunk < groups.size(); ++chunk) {
             std::vector<Splat> payload_splats;
             const size_t payload_index = hierarchy_.payloads.size();
-            for (size_t leaf_id : groups[chunk]) {
-                const AdaptiveLodLeaf& leaf = adaptive.leaves[leaf_id];
-                const size_t first = adaptive.level_count - leaf.levels.size();
-                const LodLevel& node = leaf.levels[level - first];
-                hierarchy_.leaves[leaf_id].nodes.push_back(
-                    {level, payload_index, payload_splats.size(), node.splats.size(), node.error});
-                payload_splats.insert(payload_splats.end(), node.splats.begin(), node.splats.end());
+            for (size_t node_id : groups[chunk]) {
+                const LodLevel& representation = spatial.nodes[node_id].representation;
+                Lcc2HierarchyNodeInfo& output = hierarchy_.nodes[node_id];
+                output.payload_index = payload_index;
+                output.start = payload_splats.size();
+                output.count = representation.splats.size();
+                payload_splats.insert(payload_splats.end(), representation.splats.begin(), representation.splats.end());
             }
             const std::string stem = lod_settings_.payload_layout == Lcc2PayloadLayout::Level
                 ? "lod_" + std::to_string(level)
@@ -571,16 +601,54 @@ void ConvertApp::generateLods() {
             max_payload_bytes = std::max(max_payload_bytes, fs::file_size(spz_path));
         }
     }
-    for (const AdaptiveLodLeaf& leaf : adaptive.leaves) {
-        if (leaf.levels.size() < lod_settings_.levels) {
-            log("  warning: leaf-" + std::to_string(leaf.id) + " generated " +
-                std::to_string(leaf.levels.size()) + " of " + std::to_string(lod_settings_.levels) +
-                " requested levels (further reduction was not possible)\n");
-        }
-    }
     log("  payloads: " + std::to_string(hierarchy_.payloads.size()) +
         ", maximum payload splats/bytes: " + std::to_string(max_payload_count) + "/" +
         std::to_string(max_payload_bytes) + "\n");
+    auto distribution = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        auto at = [&](double q) { return values[static_cast<size_t>(q * static_cast<double>(values.size() - 1))]; };
+        return std::to_string(values.front()) + "/" + std::to_string(at(0.5)) + "/" +
+               std::to_string(at(0.95)) + "/" + std::to_string(values.back());
+    };
+    log("  hierarchy summary:\n");
+    for (size_t level = 0; level < spatial.level_count; ++level) {
+        std::vector<double> counts, diagonals;
+        for (size_t node_id : spatial.nodes_per_level[level]) {
+            const SpatialLodNode& node = spatial.nodes[node_id];
+            counts.push_back(static_cast<double>(node.representation.splats.size()));
+            const double dx = static_cast<double>(node.bounds.max.x) - node.bounds.min.x;
+            const double dy = static_cast<double>(node.bounds.max.y) - node.bounds.min.y;
+            const double dz = static_cast<double>(node.bounds.max.z) - node.bounds.min.z;
+            diagonals.push_back(std::sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        log("    LOD" + std::to_string(level) + " nodes " + std::to_string(counts.size()) +
+            ", splats min/median/p95/max " + distribution(counts) +
+            ", diagonal min/median/p95/max " + distribution(diagonals) + "\n");
+    }
+    std::map<size_t, size_t> child_distribution;
+    std::vector<double> refinement_costs;
+    size_t unary_nodes = 0;
+    for (const SpatialLodNode& node : spatial.nodes) {
+        child_distribution[node.children.size()]++;
+        if (node.children.size() == 1) ++unary_nodes;
+        if (!node.children.empty()) {
+            size_t child_count = 0;
+            for (size_t child : node.children) child_count += spatial.nodes[child].representation.splats.size();
+            refinement_costs.push_back(static_cast<double>(child_count > node.representation.splats.size()
+                ? child_count - node.representation.splats.size() : 0));
+        }
+    }
+    std::string child_summary;
+    for (const auto& [children, count] : child_distribution) {
+        if (!child_summary.empty()) child_summary += ", ";
+        child_summary += std::to_string(children) + "->" + std::to_string(count);
+    }
+    log("    roots: " + std::to_string(spatial.roots.size()) + ", child-count distribution: " +
+        child_summary + ", unary nodes: " + std::to_string(unary_nodes) +
+        ", maximum depth: " + std::to_string(spatial.level_count) + "\n");
+    if (!refinement_costs.empty()) {
+        log("    refinement cost min/median/p95/max: " + distribution(refinement_costs) + "\n");
+    }
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     log("  generation time: " + std::to_string(seconds) + " seconds\n");
 }

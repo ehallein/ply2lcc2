@@ -44,6 +44,25 @@ struct AdaptiveLodHierarchy {
     BBox bounds;
 };
 
+struct SpatialLodNode {
+    size_t id = 0;
+    size_t level = 0; // 0 is coarsest; level_count - 1 is finest.
+    std::vector<size_t> source_indices;
+    std::vector<size_t> children;
+    BBox bounds;
+    LodLevel representation;
+};
+
+struct SpatialLodHierarchy {
+    std::vector<SpatialLodNode> nodes;
+    std::vector<size_t> roots;
+    size_t level_count = 0;
+    std::vector<std::vector<size_t>> nodes_per_level;
+    std::vector<size_t> splats_per_level;
+    std::vector<float> errors_per_level;
+    BBox bounds;
+};
+
 class LodGenerator {
 public:
     explicit LodGenerator(LodSettings settings);
@@ -55,6 +74,9 @@ public:
     // any representatives. Leaves are ordered by recursive low/high split.
     AdaptiveLodHierarchy generate_adaptive(const std::vector<Splat>& source,
                                            size_t max_leaf_splats) const;
+
+    // Builds a branching spatial forest from the finest source membership.
+    SpatialLodHierarchy generate_spatial(const std::vector<Splat>& source) const;
 
     // Exposed for focused tests and future clustering strategy replacement.
     static Splat merge_cluster(const std::vector<Splat>& splats,

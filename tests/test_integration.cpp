@@ -4,6 +4,8 @@
 #include "splat_buffer.hpp"
 #include "spatial_grid.hpp"
 #include "compression.hpp"
+#include "lod_generator.hpp"
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 using namespace ply2lcc;
@@ -100,4 +102,39 @@ TEST_F(IntegrationTest, CompareWithReferenceLCC) {
         EXPECT_EQ(sh_size % 64, 0u) << "Reference shcoef.bin size not multiple of 64";
         EXPECT_EQ(size / 32, sh_size / 64) << "Splat count mismatch";
     }
+}
+
+TEST(GardenIntegrationTest, BuildsFineGrainedBranchingHierarchyWhenFixtureIsAvailable) {
+    fs::path garden;
+    if (const char* configured = std::getenv("PLY2LCC_GARDEN_PLY")) garden = configured;
+    if (garden.empty() && fs::exists("/Users/evan/PlyData/garden.ply")) {
+        garden = "/Users/evan/PlyData/garden.ply";
+    }
+    if (garden.empty() || !fs::exists(garden)) GTEST_SKIP() << "garden.ply not available";
+
+    SplatBuffer buffer;
+    ASSERT_TRUE(buffer.initialize(garden)) << buffer.error();
+    LodSettings settings;
+    settings.levels = 5;
+    settings.reduction = 4;
+    settings.method = LodMethod::Decimate;
+    settings.max_leaf_splats = 8192;
+    settings.max_refinement_cost = 20000;
+    const auto hierarchy = LodGenerator(settings).generate_spatial(buffer.to_vector());
+    ASSERT_GT(hierarchy.nodes_per_level.back().size(), 16u);
+    size_t unary = 0;
+    for (const SpatialLodNode& node : hierarchy.nodes) {
+        if (node.children.size() == 1) ++unary;
+        if (node.level + 1 == hierarchy.level_count) {
+            EXPECT_LE(node.source_indices.size(), settings.max_leaf_splats);
+        }
+        if (!node.children.empty()) {
+            size_t children = 0;
+            for (size_t child : node.children) children += hierarchy.nodes[child].representation.splats.size();
+            const size_t cost = children > node.representation.splats.size()
+                ? children - node.representation.splats.size() : 0;
+            EXPECT_LE(cost, settings.max_refinement_cost);
+        }
+    }
+    EXPECT_EQ(unary, 0u);
 }

@@ -12,36 +12,43 @@ coincident, the source-index tie-break still divides the count deterministically
 the resulting leaves intentionally have overlapping spatial bounds.
 
 Splitting stops when a leaf contains at most `--max-leaf-splats` source splats
-(65,536 by default). Generation fails if that invariant is violated.
+(8,192 by default). `--max-node-diagonal` can request additional extent-driven
+splits when a node has at least `--min-split-splats` members. Count limits always
+take precedence. Generation fails if the finest-node count invariant is violated.
 
 ## Fixed-membership invariant
 
-Each leaf owns one immutable set of original source indices. Its finest node is
-that set exactly, and every coarser node is produced by running the existing LOD
-algorithm only on splats in the same leaf. No representative can summarize a
-splat from another leaf. Atomic parent-to-child replacement is therefore valid:
-every node in the chain represents the same fixed source region.
+Finest leaves are grouped bottom-up over the configured ranks. Adjacent leaves
+are paired; when a level has an odd count, one three-child parent avoids leaving
+a unary branch. A unary promotion is emitted only when a level genuinely has a
+single spatial node. Each parent owns the exact union of its children's original
+source indices, and its approximation is generated only from that union. Thus
+atomic parent-to-visible-children replacement preserves content while allowing
+different child regions to refine independently.
 
-Leaves that cannot be reduced through every requested level keep only their
-valid distinct levels. Their chains are fine-aligned with the global ranks, and
-generation logs each short chain. Empty or duplicate nodes are not emitted.
+The nominal reduction target is retained where possible. If it would make
+`sum(child counts) - parent count` exceed `--max-refinement-cost` (20,000 by
+default), the parent retains the coarsest available representation that satisfies
+the limit. This trades some coarse-rank payload size for bounded runtime jumps.
 
 ## Bounds and error
 
-A leaf bound is computed from its full-detail membership and reused for every
-node in its chain. For each Gaussian, it expands the centre by three times the
+A finest bound is computed from its full-detail membership. For each Gaussian,
+it expands the centre by three times the
 largest principal standard deviation on all three world axes. This spherical
 envelope is conservative under rotation and corresponds to a three-sigma
 (99.7% one-dimensional) support assumption. It also keeps each leaf's vertical
-extent local rather than copying the scene's full height.
+extent local. Internal bounds are exact unions of child bounds, so children are
+contained by their parents and bounds shrink toward finer descendants.
 
 Per-node `lodError` retains the existing accumulated maximum of centre
-displacement plus representative-radius difference. Top-level `lodErrors` use
-the maximum node error at each rank, so they conservatively summarize leaves.
+displacement plus representative-radius difference, in source coordinate units.
+Parent errors are raised to at least the maximum child error, finest errors are
+zero, and top-level `lodErrors` use the maximum node error at each rank.
 
 ## Payload layouts
 
-`--lcc2-payload-layout level` is the compatibility default. Leaves are
+`--lcc2-payload-layout level` is the compatibility default. Nodes are
 concatenated in stable ID order at each rank and one SPZ v4 file is written for
 the complete rank. Every node range is contiguous.
 
@@ -67,26 +74,36 @@ needs a separate reader/streamer change that:
 
 No QuestSplat code is changed by ply2lcc2's hierarchy work.
 
+Generated hierarchy GUIDs are derived deterministically from node structure and
+ranges. The writer also validates exact payload coverage, child containment,
+rank transitions, and monotonic errors before committing metadata.
+
 ## Garden validation
 
-The supplied `garden.ply` was regenerated in compatibility mode with the
-default cluster method, five levels, reduction factor four, and
-`--max-leaf-splats 65536`. The source contained 985,239 splats. The former
-fixed-grid hierarchy had five cells and its dominant cell contained 41,954,
-68,764, 132,770, 318,238, and 964,543 splats from coarse to fine.
+The 985,239-splat garden fixture was regenerated with the compatibility payload
+layout, cluster method, five ranks, `--max-leaf-splats 8192`, and
+`--max-refinement-cost 20000`. The former hierarchy had 16 roots, 80 renderable
+nodes, 64 unary nodes, identical bounds down each chain, and a dominant-chain
+refinement jump as large as 646,305 splats.
 
-The adaptive result has 16 leaves (minimum/median/maximum full-detail membership
-61,577 / 61,577 / 61,578):
+The branching result contains 248 renderable nodes: 8 roots, 128 finest spatial
+leaves, 120 binary internal nodes, and no unary nodes.
 
-| Coarse-to-fine rank | Total splats | Nodes | Maximum node splats |
+| Coarse-to-fine rank | Nodes | Total splats | Node-count maximum |
 |---:|---:|---:|---:|
-| 0 | 50,705 | 16 | 5,334 |
-| 1 | 80,986 | 16 | 7,761 |
-| 2 | 150,054 | 16 | 12,545 |
-| 3 | 340,547 | 16 | 24,678 |
-| 4 | 985,239 | 16 | 61,578 |
+| 0 | 8 | 48,711 | 8,757 |
+| 1 | 16 | 80,986 | 7,761 |
+| 2 | 32 | 153,190 | 7,082 |
+| 3 | 64 | 343,429 | 6,997 |
+| 4 | 128 | 985,239 | 7,698 |
 
-The compatibility package used five payloads and passed
-`splat-transform v3.3.0 meta.lcc2 --stats json null`, which reported the same
-counts in finest-to-coarsest order. This validates package structure and SPZ v4
-decoding only; visual equivalence was not tested in SuperSplat or QuestSplat.
+Refinement costs across the 120 internal nodes were 2,502 minimum, 8,924
+median, 10,898 p95, and 11,226 maximum. Finest-node bound diagonals were 2.29
+minimum, 15.77 median, 51.51 p95, and 87.54 maximum; large values reflect
+outlier Gaussian support, while median bounds shrink consistently toward finer
+ranks. The package passed writer range/bounds/error validation and
+`splat-transform v3.3.0 meta.lcc2 --stats json null`, reporting finest-first
+counts `[985239, 343429, 153190, 80986, 48711]` and SH degree 3.
+
+This validates structure and decoding only. Visual equivalence was not tested
+in SuperSplat or QuestSplat.

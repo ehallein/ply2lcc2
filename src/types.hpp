@@ -34,7 +34,10 @@ struct LodSettings {
     size_t reduction = 4;
     LodMethod method = LodMethod::Cluster;
     bool debug = false;
-    size_t max_leaf_splats = 65536;
+    size_t max_leaf_splats = 8192;
+    size_t max_refinement_cost = 20000;
+    float max_node_diagonal = 0.0f;
+    size_t min_split_splats = 1024;
     Lcc2PayloadLayout payload_layout = Lcc2PayloadLayout::Level;
     size_t max_payload_splats = 262144;
 };

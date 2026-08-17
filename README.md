@@ -60,20 +60,20 @@ Then generate a deterministic hierarchy from a PLY:
 ```
 
 Generated hierarchies partition the original source first. By default, every
-independently selectable leaf contains at most 65,536 full-detail splats:
+finest spatial node contains at most 8,192 full-detail splats:
 
 ```bash
 ./ply2lcc2 -i garden.ply -o garden_lcc2 --format lcc2 \
-  --generate-lod --max-leaf-splats 65536
+  --generate-lod --max-leaf-splats 8192 --max-refinement-cost 20000
 ```
 
-All representations in a leaf derive exclusively from that leaf's fixed source
-membership. The default `level` layout keeps one SPZ per detail rank. The
+Parents approximate the exact union of their smaller spatial children. The
+default `level` layout keeps one SPZ per detail rank. The
 opt-in `chunked` layout groups complete node representations into bounded files:
 
 ```bash
 ./ply2lcc2 -i garden.ply -o garden_lcc2_chunked --format lcc2 \
-  --generate-lod --max-leaf-splats 65536 \
+  --generate-lod --max-leaf-splats 8192 \
   --lcc2-payload-layout chunked --max-payload-splats 262144
 ```
 
@@ -98,13 +98,12 @@ preserves the complete source SH data.
 `cluster` uses spatial Morton ordering, a colour similarity threshold, weighted
 centroids, accumulated alpha, and covariance moment matching. `decimate` uses
 spatially stratified importance selection. Generated metadata concatenates
-adaptive leaves in stable order at every level and stores `lodError` as the maximum
+spatial nodes in stable order at every level and stores `lodError` as the maximum
 centre displacement plus representative-radius difference introduced by that
 level (accumulated toward coarser levels). Canonical LCC2 metadata is written
-finest-first, while the spatial tree nests progressively finer data below each
-coarse leaf node. Leaf bounds conservatively include three times the largest
-Gaussian principal scale on every world axis and remain identical throughout a
-leaf's chain.
+finest-first. Each coarser node branches into smaller children whose memberships
+exactly partition its source content. Bounds conservatively include three times
+the largest Gaussian principal scale and shrink with spatial subdivision.
 
 The generated directory has this structure:
 
@@ -176,7 +175,10 @@ This builds both the CLI (`ply2lcc2`) and GUI (`ply2lcc-gui`) executables.
 | `--lod-reduction <n>` | Approximate reduction factor per level | 4 |
 | `--lod-method cluster\|decimate` | LOD generation strategy | `cluster` |
 | `--lod-debug` | Print cluster size/error/rejection details | false |
-| `--max-leaf-splats <n>` | Maximum full-detail splats in a generated adaptive leaf | 65536 |
+| `--max-leaf-splats <n>` | Maximum full-detail splats in a finest spatial node | 8192 |
+| `--max-refinement-cost <n>` | Maximum child-count minus parent-count refinement jump | 20000 |
+| `--max-node-diagonal <d>` | Extent-driven leaf split threshold in source units; 0 disables | 0 |
+| `--min-split-splats <n>` | Minimum membership for extent-driven splitting | 1024 |
 | `--lcc2-payload-layout level\|chunked` | One payload per rank or bounded multi-file ranks | `level` |
 | `--max-payload-splats <n>` | Maximum splats per chunked payload; nodes are never split | 262144 |
 

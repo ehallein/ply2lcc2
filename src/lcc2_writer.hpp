@@ -16,17 +16,14 @@ struct Lcc2PayloadInfo {
 };
 
 struct Lcc2HierarchyNodeInfo {
+    size_t id = 0;
     size_t level = 0;
     size_t payload_index = 0;
     size_t start = 0;
     size_t count = 0;
     float error = 0.0f;
-};
-
-struct Lcc2HierarchyLeafInfo {
-    size_t id = 0;
     BBox bounds;
-    std::vector<Lcc2HierarchyNodeInfo> nodes;
+    std::vector<size_t> children;
 };
 
 struct Lcc2HierarchyInfo {
@@ -34,7 +31,8 @@ struct Lcc2HierarchyInfo {
     std::vector<size_t> splats_per_level;
     std::vector<float> errors_per_level;
     std::vector<Lcc2PayloadInfo> payloads;
-    std::vector<Lcc2HierarchyLeafInfo> leaves;
+    std::vector<Lcc2HierarchyNodeInfo> nodes;
+    std::vector<size_t> roots;
     BBox bounds;
 };
 
@@ -56,6 +54,8 @@ public:
 
 private:
     static std::string generate_guid();
+    static std::string generate_hierarchy_guid(const std::string& name,
+                                               const Lcc2HierarchyInfo& hierarchy);
     static std::string json_escape(const std::string& value);
     static void write_bbox(std::ostream& stream, const BBox& bbox, int indent);
     static BBox to_lcc2_bbox(const BBox& bbox);

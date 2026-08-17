@@ -288,6 +288,137 @@ AdaptiveLodHierarchy LodGenerator::generate_adaptive(const std::vector<Splat>& s
     return hierarchy;
 }
 
+SpatialLodHierarchy LodGenerator::generate_spatial(const std::vector<Splat>& source) const {
+    if (source.empty()) throw std::runtime_error("Cannot generate LODs from an empty scene");
+    if (settings_.max_leaf_splats == 0) throw std::runtime_error("--max-leaf-splats must be greater than zero");
+    validate(source, "source LOD");
+
+    std::vector<std::vector<size_t>> leaf_memberships;
+    std::vector<size_t> all(source.size());
+    std::iota(all.begin(), all.end(), size_t{0});
+    std::function<void(std::vector<size_t>)> split = [&](std::vector<size_t> indices) {
+        BBox centers;
+        for (size_t index : indices) centers.expand(source[index].pos);
+        const double dx = static_cast<double>(centers.max.x) - centers.min.x;
+        const double dy = static_cast<double>(centers.max.y) - centers.min.y;
+        const double dz = static_cast<double>(centers.max.z) - centers.min.z;
+        const double diagonal = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const bool over_count = indices.size() > settings_.max_leaf_splats;
+        const bool over_extent = settings_.max_node_diagonal > 0.0f &&
+            diagonal > settings_.max_node_diagonal &&
+            indices.size() >= 2 * settings_.min_split_splats;
+        if (!over_count && !over_extent) {
+            leaf_memberships.push_back(std::move(indices));
+            return;
+        }
+        const double extent[3] = {dx, dy, dz};
+        int axis = 0;
+        if (extent[1] > extent[axis]) axis = 1;
+        if (extent[2] > extent[axis]) axis = 2;
+        std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            const float av = source[a].pos[axis], bv = source[b].pos[axis];
+            return av < bv || (av == bv && a < b);
+        });
+        const size_t middle = indices.size() / 2;
+        if (middle == 0 || middle == indices.size()) {
+            throw std::runtime_error("Spatial LOD partition failed to make progress");
+        }
+        split(std::vector<size_t>(indices.begin(), indices.begin() + static_cast<ptrdiff_t>(middle)));
+        split(std::vector<size_t>(indices.begin() + static_cast<ptrdiff_t>(middle), indices.end()));
+    };
+    split(std::move(all));
+
+    SpatialLodHierarchy hierarchy;
+    hierarchy.level_count = settings_.levels;
+    hierarchy.nodes_per_level.resize(settings_.levels);
+    hierarchy.splats_per_level.assign(settings_.levels, 0);
+    hierarchy.errors_per_level.assign(settings_.levels, 0.0f);
+    const size_t finest_level = settings_.levels - 1;
+    std::vector<size_t> current;
+    for (std::vector<size_t>& membership : leaf_memberships) {
+        SpatialLodNode node;
+        node.id = hierarchy.nodes.size();
+        node.level = finest_level;
+        node.source_indices = std::move(membership);
+        node.representation.splats.reserve(node.source_indices.size());
+        for (size_t index : node.source_indices) {
+            const Splat& splat = source[index];
+            node.representation.splats.push_back(splat);
+            const float radius = kBoundsSigma * max_scale(splat);
+            node.bounds.expand(Vec3f(splat.pos.x - radius, splat.pos.y - radius, splat.pos.z - radius));
+            node.bounds.expand(Vec3f(splat.pos.x + radius, splat.pos.y + radius, splat.pos.z + radius));
+        }
+        node.representation.stats.input_count = node.source_indices.size();
+        node.representation.stats.output_count = node.source_indices.size();
+        current.push_back(node.id);
+        hierarchy.nodes_per_level[finest_level].push_back(node.id);
+        hierarchy.nodes.push_back(std::move(node));
+    }
+
+    for (size_t level = finest_level; level-- > 0;) {
+        std::vector<std::vector<size_t>> groups;
+        size_t cursor = 0;
+        if (current.size() > 1 && current.size() % 2 == 1) {
+            groups.push_back({current[0], current[1], current[2]});
+            cursor = 3;
+        }
+        while (cursor < current.size()) {
+            const size_t remaining = current.size() - cursor;
+            if (remaining == 1) groups.push_back({current[cursor++]});
+            else {
+                groups.push_back({current[cursor], current[cursor + 1]});
+                cursor += 2;
+            }
+        }
+
+        std::vector<size_t> parents;
+        parents.reserve(groups.size());
+        for (const std::vector<size_t>& children : groups) {
+            SpatialLodNode parent;
+            parent.id = hierarchy.nodes.size();
+            parent.level = level;
+            parent.children = children;
+            size_t child_splats = 0;
+            float child_error = 0.0f;
+            for (size_t child_id : children) {
+                const SpatialLodNode& child = hierarchy.nodes[child_id];
+                parent.source_indices.insert(parent.source_indices.end(),
+                                             child.source_indices.begin(), child.source_indices.end());
+                parent.bounds.expand(child.bounds);
+                child_splats += child.representation.splats.size();
+                child_error = std::max(child_error, child.representation.error);
+            }
+            std::vector<Splat> node_source;
+            node_source.reserve(parent.source_indices.size());
+            for (size_t index : parent.source_indices) node_source.push_back(source[index]);
+            LodSettings node_settings = settings_;
+            node_settings.levels = settings_.levels - level;
+            const std::vector<LodLevel> candidates = LodGenerator(node_settings).generate(std::move(node_source));
+            const size_t required_parent_count = child_splats > settings_.max_refinement_cost
+                ? child_splats - settings_.max_refinement_cost : 0;
+            size_t selected = 0;
+            while (selected + 1 < candidates.size() &&
+                   candidates[selected].splats.size() < required_parent_count) {
+                ++selected;
+            }
+            parent.representation = candidates[selected];
+            parent.representation.error = std::max(parent.representation.error, child_error);
+            parents.push_back(parent.id);
+            hierarchy.nodes_per_level[level].push_back(parent.id);
+            hierarchy.nodes.push_back(std::move(parent));
+        }
+        current = std::move(parents);
+    }
+    hierarchy.roots = current;
+    for (const SpatialLodNode& node : hierarchy.nodes) {
+        hierarchy.splats_per_level[node.level] += node.representation.splats.size();
+        hierarchy.errors_per_level[node.level] = std::max(hierarchy.errors_per_level[node.level],
+                                                           node.representation.error);
+    }
+    for (size_t root : hierarchy.roots) hierarchy.bounds.expand(hierarchy.nodes[root].bounds);
+    return hierarchy;
+}
+
 std::vector<LodLevel> LodGenerator::generate(std::vector<Splat> source) const {
     if (source.empty()) throw std::runtime_error("Cannot generate LODs from an empty scene");
     validate(source, "source LOD");

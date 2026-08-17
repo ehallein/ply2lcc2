@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cmath>
 #include <iomanip>
 #include <functional>
 #include <random>
@@ -122,6 +123,30 @@ std::string Lcc2Writer::generate_guid() {
     return result.str();
 }
 
+std::string Lcc2Writer::generate_hierarchy_guid(const std::string& name,
+                                                 const Lcc2HierarchyInfo& hierarchy) {
+    std::ostringstream canonical;
+    canonical << std::setprecision(15) << name << '|' << hierarchy.level_count;
+    for (const Lcc2HierarchyNodeInfo& node : hierarchy.nodes) {
+        canonical << '|' << node.id << ',' << node.level << ',' << node.payload_index << ','
+                  << node.start << ',' << node.count << ',' << node.error;
+        for (int axis = 0; axis < 3; ++axis) canonical << ',' << node.bounds.min[axis] << ',' << node.bounds.max[axis];
+        for (size_t child : node.children) canonical << ',' << child;
+    }
+    const std::string bytes = canonical.str();
+    auto fnv1a = [&](uint64_t hash) {
+        for (unsigned char byte : bytes) {
+            hash ^= byte;
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    };
+    std::ostringstream result;
+    result << std::hex << std::setfill('0') << std::setw(16) << fnv1a(1469598103934665603ULL)
+           << std::setw(16) << fnv1a(1099511628211ULL);
+    return result.str();
+}
+
 std::string Lcc2Writer::json_escape(const std::string& value) {
     std::ostringstream escaped;
     for (unsigned char c : value) {
@@ -174,7 +199,8 @@ void Lcc2Writer::write(const SpatialGrid& grid,
     std::vector<fs::path> payloads = payload_files.empty() ? lod_files : payload_files;
     std::vector<fs::path> payload_plys = lod_files;
     if (hierarchy) {
-        if (hierarchy->level_count == 0 || hierarchy->leaves.empty() || hierarchy->payloads.empty()) {
+        if (hierarchy->level_count == 0 || hierarchy->nodes.empty() ||
+            hierarchy->roots.empty() || hierarchy->payloads.empty()) {
             throw std::runtime_error("Generated LCC2 hierarchy is incomplete");
         }
         payloads.clear();
@@ -184,12 +210,28 @@ void Lcc2Writer::write(const SpatialGrid& grid,
             payload_plys.push_back(payload.ply_file);
         }
         std::vector<std::vector<std::pair<size_t, size_t>>> ranges(hierarchy->payloads.size());
-        for (const Lcc2HierarchyLeafInfo& leaf : hierarchy->leaves) {
-            for (const Lcc2HierarchyNodeInfo& node : leaf.nodes) {
-                if (node.count == 0 || node.payload_index >= ranges.size()) {
-                    throw std::runtime_error("Generated hierarchy contains an empty node or invalid payload reference");
+        for (const Lcc2HierarchyNodeInfo& node : hierarchy->nodes) {
+            if (node.count == 0 || node.payload_index >= ranges.size()) {
+                throw std::runtime_error("Generated hierarchy contains an empty node or invalid payload reference");
+            }
+            ranges[node.payload_index].push_back({node.start, node.count});
+            for (size_t child_id : node.children) {
+                if (child_id >= hierarchy->nodes.size() ||
+                    hierarchy->nodes[child_id].level != node.level + 1) {
+                    throw std::runtime_error("Generated hierarchy has an invalid parent/child level transition");
                 }
-                ranges[node.payload_index].push_back({node.start, node.count});
+                const Lcc2HierarchyNodeInfo& child = hierarchy->nodes[child_id];
+                constexpr float tolerance = 1e-4f;
+                for (int axis = 0; axis < 3; ++axis) {
+                    if (child.bounds.min[axis] < node.bounds.min[axis] - tolerance ||
+                        child.bounds.max[axis] > node.bounds.max[axis] + tolerance) {
+                        throw std::runtime_error("Generated hierarchy child bounds escape parent bounds");
+                    }
+                }
+                if (!std::isfinite(node.error) || node.error < 0.0f ||
+                    node.error + tolerance < child.error) {
+                    throw std::runtime_error("Generated hierarchy LOD errors are invalid or non-monotonic");
+                }
             }
         }
         for (size_t payload_index = 0; payload_index < ranges.size(); ++payload_index) {
@@ -301,7 +343,7 @@ void Lcc2Writer::write(const SpatialGrid& grid,
              << "\t\"name\": \"" << json_escape(name) << "\",\n"
              << "\t\"description\": \"Converted from PLY by ply2lcc; LCC2 data organization format originated from XGRIDS\",\n"
              << "\t\"epsg\": 0,\n"
-             << "\t\"guid\": \"" << generate_guid() << "\",\n"
+             << "\t\"guid\": \"" << (hierarchy ? generate_hierarchy_guid(name, *hierarchy) : generate_guid()) << "\",\n"
              << "\t\"source\": \"ply2lcc\",\n"
              << "\t\"dataType\": \"3DGS\",\n"
              << "\t\"offset\": [0, 0, 0],\n"
@@ -348,7 +390,7 @@ void Lcc2Writer::write(const SpatialGrid& grid,
     const BBox lcc2_scene_bbox = to_lcc2_bbox(hierarchy ? hierarchy->bounds : grid.bbox());
     write_bbox(metadata, lcc2_scene_bbox, 2);
     metadata << ",\n"
-             << "\t\t\"childNum\": " << (hierarchy ? hierarchy->leaves.size() :
+             << "\t\t\"childNum\": " << (hierarchy ? hierarchy->roots.size() :
                     (lod_errors.empty() ? lod_files.size() : grid.cells().size())) << ",\n"
              << "\t\t\"data\": ";
     if (has_environment) {
@@ -366,40 +408,38 @@ void Lcc2Writer::write(const SpatialGrid& grid,
              << "\t\t\"child\": {\n";
 
     if (hierarchy) {
-        for (size_t leaf_index = 0; leaf_index < hierarchy->leaves.size(); ++leaf_index) {
-            const Lcc2HierarchyLeafInfo& leaf = hierarchy->leaves[leaf_index];
-            if (leaf.nodes.empty()) throw std::runtime_error("Generated hierarchy leaf has no LOD nodes");
-            const BBox leaf_bbox = to_lcc2_bbox(leaf.bounds);
-            metadata << "\t\t\t\"" << leaf_index << "\": {\n"
-                     << "\t\t\t\t\"id\": \"leaf-" << leaf.id << "\",\n"
-                     << "\t\t\t\t\"boundingBox\": ";
-            write_bbox(metadata, leaf_bbox, 4);
-            std::function<void(size_t, int)> write_node;
-            write_node = [&](size_t depth, int indent) {
-                const Lcc2HierarchyNodeInfo& node = leaf.nodes[depth];
-                if (node.payload_index >= hierarchy->payloads.size() ||
-                    node.start + node.count > hierarchy->payloads[node.payload_index].splat_count) {
-                    throw std::runtime_error("Generated hierarchy node range is outside its payload");
+        std::function<void(size_t, int)> write_node;
+        write_node = [&](size_t node_id, int indent) {
+            const Lcc2HierarchyNodeInfo& node = hierarchy->nodes[node_id];
+            if (node.payload_index >= hierarchy->payloads.size() ||
+                node.start + node.count > hierarchy->payloads[node.payload_index].splat_count) {
+                throw std::runtime_error("Generated hierarchy node range is outside its payload");
+            }
+            const std::string pad(static_cast<size_t>(indent), '\t');
+            metadata << "{\n" << pad << "\t\"id\": \"node-" << node.id << "\",\n"
+                     << pad << "\t\"boundingBox\": ";
+            write_bbox(metadata, to_lcc2_bbox(node.bounds), indent + 1);
+            metadata << ",\n" << pad << "\t\"lodLevel\": " << (hierarchy->level_count - 1 - node.level)
+                     << ",\n" << pad << "\t\"lodError\": " << node.error
+                     << ",\n" << pad << "\t\"childNum\": " << node.children.size()
+                     << ",\n" << pad << "\t\"data\": {\"3dgs\": {\"name\": " << node.payload_index
+                     << ", \"start\": " << node.start << ", \"count\": " << node.count << "}},\n"
+                     << pad << "\t\"child\": {";
+            if (!node.children.empty()) {
+                metadata << "\n";
+                for (size_t i = 0; i < node.children.size(); ++i) {
+                    metadata << pad << "\t\t\"" << i << "\": ";
+                    write_node(node.children[i], indent + 2);
+                    metadata << (i + 1 == node.children.size() ? "\n" : ",\n");
                 }
-                const std::string pad(static_cast<size_t>(indent), '\t');
-                metadata << ",\n" << pad << "\"lodLevel\": " << (hierarchy->level_count - 1 - node.level)
-                         << ",\n" << pad << "\"lodError\": " << node.error
-                         << ",\n" << pad << "\"childNum\": " << (depth + 1 < leaf.nodes.size() ? 1 : 0)
-                         << ",\n" << pad << "\"data\": {\"3dgs\": {\"name\": " << node.payload_index
-                         << ", \"start\": " << node.start << ", \"count\": " << node.count << "}}";
-                if (depth + 1 < leaf.nodes.size()) {
-                    const auto& child = leaf.nodes[depth + 1];
-                    metadata << ",\n" << pad << "\"child\": {\n"
-                             << pad << "\t\"" << child.level << "\": {\n"
-                             << pad << "\t\t\"id\": \"leaf-" << leaf.id << "-lod-" << child.level << "\",\n"
-                             << pad << "\t\t\"boundingBox\": ";
-                    write_bbox(metadata, leaf_bbox, indent + 2);
-                    write_node(depth + 1, indent + 2);
-                    metadata << "\n" << pad << "\t}\n" << pad << "}";
-                }
-            };
-            write_node(0, 4);
-            metadata << "\n\t\t\t}" << (leaf_index + 1 == hierarchy->leaves.size() ? "\n" : ",\n");
+                metadata << pad << "\t";
+            }
+            metadata << "}\n" << pad << "}";
+        };
+        for (size_t root_index = 0; root_index < hierarchy->roots.size(); ++root_index) {
+            metadata << "\t\t\t\"" << root_index << "\": ";
+            write_node(hierarchy->roots[root_index], 3);
+            metadata << (root_index + 1 == hierarchy->roots.size() ? "\n" : ",\n");
         }
     } else if (lod_errors.empty()) {
         for (size_t lod = 0; lod < lod_files.size(); ++lod) {

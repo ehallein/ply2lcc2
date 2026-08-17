@@ -214,3 +214,114 @@ TEST(LodGeneratorTest, RejectsImpossibleLeafLimit) {
     LodGenerator generator(settings);
     EXPECT_THROW(generator.generate_adaptive({make_splat(0, 0, 0, 1, 1, 1)}, 0), std::runtime_error);
 }
+
+TEST(LodGeneratorTest, SpatialHierarchyBranchesAndPreservesMembership) {
+    std::vector<Splat> source;
+    for (int cluster = 0; cluster < 2; ++cluster) {
+        for (int i = 0; i < 64; ++i) {
+            source.push_back(make_splat(cluster * 100.0f + (i % 8) * 0.01f,
+                                        (i / 8) * 0.01f, 0, 0.5f, 0.5f, 0.5f));
+        }
+    }
+    LodSettings settings;
+    settings.levels = 3;
+    settings.reduction = 2;
+    settings.method = LodMethod::Decimate;
+    settings.max_leaf_splats = 8;
+    settings.max_refinement_cost = 10;
+    LodGenerator generator(settings);
+    const auto hierarchy = generator.generate_spatial(source);
+
+    EXPECT_GT(hierarchy.nodes_per_level.back().size(), hierarchy.roots.size());
+    size_t unary = 0;
+    for (const auto& node : hierarchy.nodes) {
+        if (node.children.size() == 1) ++unary;
+        std::set<size_t> child_membership;
+        size_t child_splats = 0;
+        for (size_t child_id : node.children) {
+            const auto& child = hierarchy.nodes[child_id];
+            EXPECT_EQ(child.level, node.level + 1);
+            EXPECT_LE(child.representation.error, node.representation.error + 1e-5f);
+            for (int axis = 0; axis < 3; ++axis) {
+                EXPECT_GE(child.bounds.min[axis], node.bounds.min[axis] - 1e-5f);
+                EXPECT_LE(child.bounds.max[axis], node.bounds.max[axis] + 1e-5f);
+            }
+            child_membership.insert(child.source_indices.begin(), child.source_indices.end());
+            child_splats += child.representation.splats.size();
+        }
+        if (!node.children.empty()) {
+            EXPECT_EQ(child_membership, std::set<size_t>(node.source_indices.begin(), node.source_indices.end()));
+            const size_t cost = child_splats > node.representation.splats.size()
+                ? child_splats - node.representation.splats.size() : 0;
+            EXPECT_LE(cost, settings.max_refinement_cost);
+        }
+    }
+    EXPECT_EQ(unary, 0u);
+    ASSERT_GE(hierarchy.roots.size(), 2u);
+    bool low_root = false, high_root = false;
+    for (size_t root_id : hierarchy.roots) {
+        const auto& root = hierarchy.nodes[root_id];
+        if (root.bounds.max.x < 50.0f) low_root = true;
+        if (root.bounds.min.x > 50.0f) high_root = true;
+    }
+    EXPECT_TRUE(low_root);
+    EXPECT_TRUE(high_root);
+}
+
+TEST(LodGeneratorTest, SpatialHierarchyHandlesDenseSparseAndPlanarInputDeterministically) {
+    std::vector<Splat> source;
+    for (int i = 0; i < 90; ++i) {
+        source.push_back(make_splat((i % 10) * 0.01f, (i / 10) * 0.01f, 0,
+                                    0.5f, 0.5f, 0.5f));
+    }
+    for (int i = 0; i < 10; ++i) {
+        source.push_back(make_splat(100.0f + i, 0, 0, 0.5f, 0.5f, 0.5f));
+    }
+    LodSettings settings;
+    settings.levels = 4;
+    settings.reduction = 2;
+    settings.method = LodMethod::Decimate;
+    settings.max_leaf_splats = 10;
+    settings.max_refinement_cost = 12;
+    const LodGenerator generator(settings);
+    const auto first = generator.generate_spatial(source);
+    const auto second = generator.generate_spatial(source);
+    ASSERT_EQ(first.nodes.size(), second.nodes.size());
+    ASSERT_EQ(first.roots, second.roots);
+    for (size_t i = 0; i < first.nodes.size(); ++i) {
+        const auto& a = first.nodes[i];
+        const auto& b = second.nodes[i];
+        EXPECT_EQ(a.level, b.level);
+        EXPECT_EQ(a.children, b.children);
+        EXPECT_EQ(a.source_indices, b.source_indices);
+        EXPECT_EQ(a.representation.splats.size(), b.representation.splats.size());
+        EXPECT_FLOAT_EQ(a.representation.error, b.representation.error);
+        for (int axis = 0; axis < 3; ++axis) {
+            EXPECT_TRUE(std::isfinite(a.bounds.min[axis]));
+            EXPECT_TRUE(std::isfinite(a.bounds.max[axis]));
+            EXPECT_FLOAT_EQ(a.bounds.min[axis], b.bounds.min[axis]);
+            EXPECT_FLOAT_EQ(a.bounds.max[axis], b.bounds.max[axis]);
+        }
+    }
+    for (size_t leaf_id : first.nodes_per_level.back()) {
+        EXPECT_LE(first.nodes[leaf_id].source_indices.size(), settings.max_leaf_splats);
+    }
+}
+
+TEST(LodGeneratorTest, SpatialDiagonalLimitTriggersAdditionalFineSplits) {
+    std::vector<Splat> source;
+    for (int i = 0; i < 4; ++i) {
+        source.push_back(make_splat(static_cast<float>(i), 0, 0, 0.5f, 0.5f, 0.5f));
+    }
+    LodSettings settings;
+    settings.levels = 2;
+    settings.method = LodMethod::Decimate;
+    settings.max_leaf_splats = 100;
+    settings.max_node_diagonal = 0.5f;
+    settings.min_split_splats = 1;
+    const auto hierarchy = LodGenerator(settings).generate_spatial(source);
+    EXPECT_EQ(hierarchy.nodes_per_level.back().size(), 4u);
+    for (size_t leaf : hierarchy.nodes_per_level.back()) {
+        EXPECT_EQ(hierarchy.nodes[leaf].source_indices.size(), 1u);
+    }
+}
