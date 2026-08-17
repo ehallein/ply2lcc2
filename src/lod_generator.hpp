@@ -27,12 +27,34 @@ struct LodLevel {
     LodLevelStats stats;
 };
 
+// A leaf owns a fixed subset of the original source. Every level is generated
+// exclusively from that subset and levels are stored coarsest-to-finest.
+struct AdaptiveLodLeaf {
+    size_t id = 0;
+    std::vector<size_t> source_indices;
+    BBox bounds;
+    std::vector<LodLevel> levels;
+};
+
+struct AdaptiveLodHierarchy {
+    std::vector<AdaptiveLodLeaf> leaves;
+    size_t level_count = 0;
+    std::vector<size_t> splats_per_level;
+    std::vector<float> errors_per_level;
+    BBox bounds;
+};
+
 class LodGenerator {
 public:
     explicit LodGenerator(LodSettings settings);
 
     // Returns levels in LCC2 order: LOD0 is coarsest, the last level is original.
     std::vector<LodLevel> generate(std::vector<Splat> source) const;
+
+    // Deterministically partitions the full-detail source before generating
+    // any representatives. Leaves are ordered by recursive low/high split.
+    AdaptiveLodHierarchy generate_adaptive(const std::vector<Splat>& source,
+                                           size_t max_leaf_splats) const;
 
     // Exposed for focused tests and future clustering strategy replacement.
     static Splat merge_cluster(const std::vector<Splat>& splats,

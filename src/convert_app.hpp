@@ -3,6 +3,7 @@
 
 #include "types.hpp"
 #include "lod_generator.hpp"
+#include "lcc2_writer.hpp"
 #include <string>
 #include <vector>
 #include <filesystem>
@@ -46,6 +47,8 @@ private:
     std::filesystem::path generated_lod_dir_;
     std::vector<float> lod_errors_;
     std::vector<LodLevelStats> lod_stats_;
+    Lcc2HierarchyInfo hierarchy_;
+    bool has_generated_hierarchy_ = false;
 
     // Discovered files
     std::vector<std::filesystem::path> lod_files_;

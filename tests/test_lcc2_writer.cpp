@@ -2,6 +2,7 @@
 
 #include "convert_app.hpp"
 #include "splat_buffer.hpp"
+#include "lod_generator.hpp"
 
 #include <array>
 #include <filesystem>
@@ -79,6 +80,20 @@ std::string read_text(const fs::path& path) {
     std::ostringstream contents;
     contents << file.rdbuf();
     return contents.str();
+}
+
+void write_many_splats(const fs::path& path, size_t count) {
+    std::vector<Splat> splats;
+    splats.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        Splat splat{};
+        splat.pos = Vec3f(static_cast<float>(i % 4), static_cast<float>((i / 4) % 4),
+                          static_cast<float>(i / 16));
+        splat.scale = Vec3f(-2.0f, -2.0f, -2.0f);
+        splat.rot[0] = 1.0f;
+        splats.push_back(splat);
+    }
+    LodGenerator::write_binary_ply(path, splats, 0);
 }
 
 } // namespace
@@ -196,14 +211,14 @@ TEST(Lcc2WriterTest, GeneratedLodUsesSpatialHierarchyAndErrorMetadata) {
     EXPECT_NE(metadata.find("\"start\":"), std::string::npos);
     EXPECT_NE(metadata.find("\"count\":"), std::string::npos);
     EXPECT_NE(metadata.find("\"splatType\": \".spz\""), std::string::npos);
-    const size_t cell = metadata.find("\"id\": \"cell-0\"");
-    const size_t cell_data = metadata.find("\"data\": {\"3dgs\"", cell);
-    const size_t cell_child = metadata.find("\"child\": {", cell);
-    ASSERT_NE(cell, std::string::npos);
-    ASSERT_NE(cell_data, std::string::npos);
-    ASSERT_NE(cell_child, std::string::npos);
-    EXPECT_LT(cell_data, cell_child);
-    EXPECT_NE(metadata.find("\"lodLevel\": 1", cell), std::string::npos);
+    const size_t leaf = metadata.find("\"id\": \"leaf-0\"");
+    const size_t leaf_data = metadata.find("\"data\": {\"3dgs\"", leaf);
+    const size_t leaf_child = metadata.find("\"child\": {", leaf);
+    ASSERT_NE(leaf, std::string::npos);
+    ASSERT_NE(leaf_data, std::string::npos);
+    ASSERT_NE(leaf_child, std::string::npos);
+    EXPECT_LT(leaf_data, leaf_child);
+    EXPECT_NE(metadata.find("\"lodLevel\": 1", leaf), std::string::npos);
     EXPECT_TRUE(fs::exists(output / "data" / "3dgs" / "lod_0.spz"));
     EXPECT_TRUE(fs::exists(output / "data" / "3dgs" / "lod_1.spz"));
     std::ifstream coarse_spz(output / "data" / "3dgs" / "lod_0.spz", std::ios::binary);
@@ -213,4 +228,85 @@ TEST(Lcc2WriterTest, GeneratedLodUsesSpatialHierarchyAndErrorMetadata) {
     EXPECT_EQ(coarse_header[12], 1);
     EXPECT_FALSE(fs::exists(output / ".generated_lod"));
     fs::remove_all(base);
+}
+
+
+TEST(Lcc2WriterTest, AdaptiveCompatibilityUsesOnePayloadPerLevel) {
+    const fs::path base = fs::temp_directory_path() / "ply2lcc_lcc2_adaptive_level_test";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    const fs::path input = base / "dense.ply";
+    const fs::path output = base / "output";
+    write_many_splats(input, 24);
+
+    ConvertConfig config;
+    config.input_path = input;
+    config.output_dir = output;
+    config.output_format = OutputFormat::Lcc2;
+    config.include_env = false;
+    config.lod.generate = true;
+    config.lod.levels = 2;
+    config.lod.reduction = 2;
+    config.lod.method = LodMethod::Decimate;
+    config.lod.max_leaf_splats = 6;
+    config.splat_transform_path = PLY2LCC_FAKE_SPLAT_TRANSFORM;
+    ConvertApp(config).run();
+
+    const std::string metadata = read_text(output / "meta.lcc2");
+    EXPECT_TRUE(fs::exists(output / "data/3dgs/lod_0.spz"));
+    EXPECT_TRUE(fs::exists(output / "data/3dgs/lod_1.spz"));
+    EXPECT_FALSE(fs::exists(output / "data/3dgs/lod_0_chunk_0.spz"));
+    EXPECT_NE(metadata.find("\"id\": \"leaf-3\""), std::string::npos);
+    EXPECT_NE(metadata.find("\"count\": 6"), std::string::npos);
+}
+
+TEST(Lcc2WriterTest, ChunkedPayloadsAreBoundedAndReferenced) {
+    const fs::path base = fs::temp_directory_path() / "ply2lcc_lcc2_chunked_test";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    const fs::path input = base / "dense.ply";
+    const fs::path output = base / "output";
+    write_many_splats(input, 24);
+
+    ConvertConfig config;
+    config.input_path = input;
+    config.output_dir = output;
+    config.output_format = OutputFormat::Lcc2;
+    config.include_env = false;
+    config.lod.generate = true;
+    config.lod.levels = 2;
+    config.lod.reduction = 2;
+    config.lod.method = LodMethod::Decimate;
+    config.lod.max_leaf_splats = 6;
+    config.lod.payload_layout = Lcc2PayloadLayout::Chunked;
+    config.lod.max_payload_splats = 7;
+    config.splat_transform_path = PLY2LCC_FAKE_SPLAT_TRANSFORM;
+    ConvertApp(config).run();
+
+    const std::string metadata = read_text(output / "meta.lcc2");
+    EXPECT_TRUE(fs::exists(output / "data/3dgs/lod_1_chunk_0.spz"));
+    EXPECT_TRUE(fs::exists(output / "data/3dgs/lod_1_chunk_3.spz"));
+    EXPECT_NE(metadata.find("data/3dgs/lod_1_chunk_3.spz"), std::string::npos);
+    EXPECT_NE(metadata.find("\"name\": 5, \"start\": 0, \"count\": 6"), std::string::npos);
+}
+
+TEST(Lcc2WriterTest, ChunkedLayoutRejectsPayloadSmallerThanANode) {
+    const fs::path base = fs::temp_directory_path() / "ply2lcc_lcc2_chunk_too_small_test";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    const fs::path input = base / "dense.ply";
+    write_many_splats(input, 8);
+    ConvertConfig config;
+    config.input_path = input;
+    config.output_dir = base / "output";
+    config.output_format = OutputFormat::Lcc2;
+    config.include_env = false;
+    config.lod.generate = true;
+    config.lod.levels = 2;
+    config.lod.method = LodMethod::Decimate;
+    config.lod.max_leaf_splats = 8;
+    config.lod.payload_layout = Lcc2PayloadLayout::Chunked;
+    config.lod.max_payload_splats = 4;
+    config.splat_transform_path = PLY2LCC_FAKE_SPLAT_TRANSFORM;
+    EXPECT_THROW(ConvertApp(config).run(), std::runtime_error);
 }

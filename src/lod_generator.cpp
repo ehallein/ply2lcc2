@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -20,6 +21,10 @@ constexpr double kEpsilon = 1e-8;
 constexpr float kShC0 = 0.28209479177387814f;
 constexpr float kColourThreshold = 0.30f;
 constexpr float kSpatialThresholdFactor = 2.5f;
+// Gaussian support used for conservative hierarchy bounds. Three standard
+// deviations contains 99.7% of a one-dimensional Gaussian. We use the maximum
+// principal scale on every world axis, which remains conservative under rotation.
+constexpr float kBoundsSigma = 3.0f;
 
 struct Mat3 {
     double v[3][3]{};
@@ -210,6 +215,77 @@ LodGenerator::LodGenerator(LodSettings settings) : settings_(settings) {
     if (settings_.levels > 32) throw std::runtime_error("--lod-levels must not exceed 32");
     if (settings_.reduction < 2) throw std::runtime_error("--lod-reduction must be at least 2");
     if (settings_.reduction > 1024) throw std::runtime_error("--lod-reduction must not exceed 1024");
+}
+
+AdaptiveLodHierarchy LodGenerator::generate_adaptive(const std::vector<Splat>& source,
+                                                       size_t max_leaf_splats) const {
+    if (source.empty()) throw std::runtime_error("Cannot generate LODs from an empty scene");
+    if (max_leaf_splats == 0) throw std::runtime_error("--max-leaf-splats must be greater than zero");
+    validate(source, "source LOD");
+
+    std::vector<std::vector<size_t>> memberships;
+    std::vector<size_t> root(source.size());
+    std::iota(root.begin(), root.end(), size_t{0});
+    std::function<void(std::vector<size_t>)> split = [&](std::vector<size_t> indices) {
+        if (indices.size() <= max_leaf_splats) {
+            memberships.push_back(std::move(indices));
+            return;
+        }
+        BBox centers;
+        for (size_t index : indices) centers.expand(source[index].pos);
+        const float extent[3] = {centers.max.x - centers.min.x,
+                                 centers.max.y - centers.min.y,
+                                 centers.max.z - centers.min.z};
+        int axis = 0;
+        if (extent[1] > extent[axis]) axis = 1;
+        if (extent[2] > extent[axis]) axis = 2;
+        std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            const float av = source[a].pos[axis], bv = source[b].pos[axis];
+            return av < bv || (av == bv && a < b);
+        });
+        const size_t middle = indices.size() / 2;
+        if (middle == 0 || middle == indices.size()) {
+            throw std::runtime_error("Adaptive LOD partition failed to make progress");
+        }
+        std::vector<size_t> low(indices.begin(), indices.begin() + static_cast<ptrdiff_t>(middle));
+        std::vector<size_t> high(indices.begin() + static_cast<ptrdiff_t>(middle), indices.end());
+        split(std::move(low));
+        split(std::move(high));
+    };
+    split(std::move(root));
+
+    AdaptiveLodHierarchy hierarchy;
+    hierarchy.leaves.reserve(memberships.size());
+    for (size_t leaf_id = 0; leaf_id < memberships.size(); ++leaf_id) {
+        AdaptiveLodLeaf leaf;
+        leaf.id = leaf_id;
+        leaf.source_indices = std::move(memberships[leaf_id]);
+        std::vector<Splat> leaf_source;
+        leaf_source.reserve(leaf.source_indices.size());
+        for (size_t index : leaf.source_indices) {
+            const Splat& splat = source[index];
+            leaf_source.push_back(splat);
+            const float radius = kBoundsSigma * max_scale(splat);
+            leaf.bounds.expand(Vec3f(splat.pos.x - radius, splat.pos.y - radius, splat.pos.z - radius));
+            leaf.bounds.expand(Vec3f(splat.pos.x + radius, splat.pos.y + radius, splat.pos.z + radius));
+        }
+        leaf.levels = generate(std::move(leaf_source));
+        hierarchy.level_count = std::max(hierarchy.level_count, leaf.levels.size());
+        hierarchy.bounds.expand(leaf.bounds);
+        hierarchy.leaves.push_back(std::move(leaf));
+    }
+
+    hierarchy.splats_per_level.assign(hierarchy.level_count, 0);
+    hierarchy.errors_per_level.assign(hierarchy.level_count, 0.0f);
+    for (const AdaptiveLodLeaf& leaf : hierarchy.leaves) {
+        const size_t first_level = hierarchy.level_count - leaf.levels.size();
+        for (size_t local = 0; local < leaf.levels.size(); ++local) {
+            const size_t level = first_level + local;
+            hierarchy.splats_per_level[level] += leaf.levels[local].splats.size();
+            hierarchy.errors_per_level[level] = std::max(hierarchy.errors_per_level[level], leaf.levels[local].error);
+        }
+    }
+    return hierarchy;
 }
 
 std::vector<LodLevel> LodGenerator::generate(std::vector<Splat> source) const {

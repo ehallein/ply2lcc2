@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <set>
 
 using namespace ply2lcc;
 
@@ -111,4 +112,105 @@ TEST(LodGeneratorTest, DecimationReducesAndIsDeterministic) {
         EXPECT_EQ(std::memcmp(first[level].splats.data(), second[level].splats.data(),
                               first[level].splats.size() * sizeof(Splat)), 0);
     }
+}
+
+TEST(LodGeneratorTest, AdaptivePartitionIsBoundedDeterministicAndComplete) {
+    std::vector<Splat> source;
+    for (int i = 0; i < 101; ++i) {
+        source.push_back(make_splat(static_cast<float>(i % 11), static_cast<float>(i / 11),
+                                    static_cast<float>(i % 3), 0.5f, 0.5f, 0.5f));
+    }
+    LodSettings settings;
+    settings.levels = 3;
+    settings.reduction = 4;
+    settings.method = LodMethod::Decimate;
+    LodGenerator generator(settings);
+    const auto first = generator.generate_adaptive(source, 16);
+    const auto second = generator.generate_adaptive(source, 16);
+
+    ASSERT_GT(first.leaves.size(), 1u);
+    ASSERT_EQ(first.leaves.size(), second.leaves.size());
+    std::set<size_t> membership;
+    for (size_t i = 0; i < first.leaves.size(); ++i) {
+        const auto& leaf = first.leaves[i];
+        EXPECT_EQ(leaf.id, i);
+        EXPECT_FALSE(leaf.source_indices.empty());
+        EXPECT_LE(leaf.source_indices.size(), 16u);
+        EXPECT_EQ(leaf.source_indices, second.leaves[i].source_indices);
+        ASSERT_FALSE(leaf.levels.empty());
+        EXPECT_EQ(leaf.levels.back().splats.size(), leaf.source_indices.size());
+        for (size_t index : leaf.source_indices) EXPECT_TRUE(membership.insert(index).second);
+    }
+    EXPECT_EQ(membership.size(), source.size());
+}
+
+TEST(LodGeneratorTest, CoincidentPointsSplitWithoutEmptyOrNonProgressingLeaves) {
+    std::vector<Splat> source(37, make_splat(1, 2, 3, 0.5f, 0.5f, 0.5f));
+    LodSettings settings;
+    settings.levels = 2;
+    settings.method = LodMethod::Decimate;
+    LodGenerator generator(settings);
+    const auto hierarchy = generator.generate_adaptive(source, 8);
+    EXPECT_EQ(hierarchy.leaves.size(), 8u);
+    size_t total = 0;
+    for (const auto& leaf : hierarchy.leaves) {
+        EXPECT_FALSE(leaf.source_indices.empty());
+        EXPECT_LE(leaf.source_indices.size(), 8u);
+        total += leaf.source_indices.size();
+    }
+    EXPECT_EQ(total, source.size());
+}
+
+TEST(LodGeneratorTest, LeafBoundsIncludeThreeSigmaSupportAndRemainLocalInHeight) {
+    std::vector<Splat> source;
+    for (int i = 0; i < 8; ++i) {
+        source.push_back(make_splat(static_cast<float>(i), 0, i < 4 ? 0.0f : 100.0f,
+                                    0.5f, 0.5f, 0.5f, 0.5f, 0.25f));
+    }
+    LodSettings settings;
+    settings.levels = 2;
+    settings.method = LodMethod::Decimate;
+    LodGenerator generator(settings);
+    const auto hierarchy = generator.generate_adaptive(source, 4);
+    ASSERT_EQ(hierarchy.leaves.size(), 2u);
+    for (const auto& leaf : hierarchy.leaves) {
+        for (int axis = 0; axis < 3; ++axis) {
+            EXPECT_TRUE(std::isfinite(leaf.bounds.min[axis]));
+            EXPECT_TRUE(std::isfinite(leaf.bounds.max[axis]));
+            EXPECT_LE(leaf.bounds.min[axis], leaf.bounds.max[axis]);
+        }
+        EXPECT_LT(leaf.bounds.max.z - leaf.bounds.min.z, 10.0f);
+        for (size_t index : leaf.source_indices) {
+            EXPECT_LE(leaf.bounds.min.x, source[index].pos.x - 0.75f + 1e-5f);
+            EXPECT_GE(leaf.bounds.max.x, source[index].pos.x + 0.75f - 1e-5f);
+        }
+    }
+}
+
+TEST(LodGeneratorTest, RepresentativesNeverCrossLeafMembershipBoundaries) {
+    const std::vector<Splat> source{
+        make_splat(0.0f, 0, 0, 0.5f, 0.5f, 0.5f),
+        make_splat(0.01f, 0, 0, 0.5f, 0.5f, 0.5f),
+        make_splat(100.0f, 0, 0, 0.5f, 0.5f, 0.5f),
+        make_splat(100.01f, 0, 0, 0.5f, 0.5f, 0.5f)};
+    LodSettings settings;
+    settings.levels = 2;
+    settings.reduction = 2;
+    settings.method = LodMethod::Cluster;
+    LodGenerator generator(settings);
+    const auto hierarchy = generator.generate_adaptive(source, 2);
+    ASSERT_EQ(hierarchy.leaves.size(), 2u);
+    for (const Splat& representative : hierarchy.leaves[0].levels.front().splats) {
+        EXPECT_LT(representative.pos.x, 50.0f);
+    }
+    for (const Splat& representative : hierarchy.leaves[1].levels.front().splats) {
+        EXPECT_GT(representative.pos.x, 50.0f);
+    }
+}
+
+TEST(LodGeneratorTest, RejectsImpossibleLeafLimit) {
+    LodSettings settings;
+    settings.levels = 2;
+    LodGenerator generator(settings);
+    EXPECT_THROW(generator.generate_adaptive({make_splat(0, 0, 0, 1, 1, 1)}, 0), std::runtime_error);
 }

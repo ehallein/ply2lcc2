@@ -8,6 +8,36 @@
 
 namespace ply2lcc {
 
+struct Lcc2PayloadInfo {
+    std::filesystem::path ply_file;
+    std::filesystem::path payload_file;
+    size_t level = 0;
+    size_t splat_count = 0;
+};
+
+struct Lcc2HierarchyNodeInfo {
+    size_t level = 0;
+    size_t payload_index = 0;
+    size_t start = 0;
+    size_t count = 0;
+    float error = 0.0f;
+};
+
+struct Lcc2HierarchyLeafInfo {
+    size_t id = 0;
+    BBox bounds;
+    std::vector<Lcc2HierarchyNodeInfo> nodes;
+};
+
+struct Lcc2HierarchyInfo {
+    size_t level_count = 0;
+    std::vector<size_t> splats_per_level;
+    std::vector<float> errors_per_level;
+    std::vector<Lcc2PayloadInfo> payloads;
+    std::vector<Lcc2HierarchyLeafInfo> leaves;
+    BBox bounds;
+};
+
 class Lcc2Writer {
 public:
     explicit Lcc2Writer(const std::filesystem::path& output_dir,
@@ -21,7 +51,8 @@ public:
                const std::vector<std::filesystem::path>& payload_files,
                const std::filesystem::path& environment_file,
                const std::string& name,
-               const std::vector<float>& lod_errors = {});
+               const std::vector<float>& lod_errors = {},
+               const Lcc2HierarchyInfo* hierarchy = nullptr);
 
 private:
     static std::string generate_guid();

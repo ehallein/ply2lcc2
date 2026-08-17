@@ -23,12 +23,20 @@ enum class LodMethod {
     Cluster
 };
 
+enum class Lcc2PayloadLayout {
+    Level,
+    Chunked
+};
+
 struct LodSettings {
     bool generate = false;
     size_t levels = 5;
     size_t reduction = 4;
     LodMethod method = LodMethod::Cluster;
     bool debug = false;
+    size_t max_leaf_splats = 65536;
+    Lcc2PayloadLayout payload_layout = Lcc2PayloadLayout::Level;
+    size_t max_payload_splats = 262144;
 };
 
 struct Vec3f {

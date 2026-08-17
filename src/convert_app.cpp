@@ -115,7 +115,8 @@ void ConvertApp::run() {
         reportProgress(90, "Writing LCC2 package...");
         log("\nPhase 2: Writing LCC2 package...\n");
         Lcc2Writer writer(output_dir_, splat_transform_path_);
-        writer.write(grid, lod_files_, lcc2_payload_files_, env_file_, base_name_, lod_errors_);
+        writer.write(grid, lod_files_, lcc2_payload_files_, env_file_, base_name_, lod_errors_,
+                     has_generated_hierarchy_ ? &hierarchy_ : nullptr);
         if (!generated_lod_dir_.empty()) {
             fs::remove_all(generated_lod_dir_);
         }
@@ -194,10 +195,24 @@ void ConvertApp::printUsage() {
               << "  --lod-reduction N  Approximate reduction per level (default: 4)\n"
               << "  --lod-method M     cluster (default) or decimate\n"
               << "  --lod-debug        Print detailed LOD generation statistics\n"
+              << "  --max-leaf-splats N Maximum full-detail splats per adaptive leaf (default: 65536)\n"
+              << "  --lcc2-payload-layout L level (default) or chunked\n"
+              << "  --max-payload-splats N Maximum splats per chunked payload (default: 262144)\n"
               << "  --cell-size X,Y    Grid cell size in meters (default: 30,30)\n";
 }
 
 void ConvertApp::parseArgs() {
+    auto parse_count = [](const char* value, const std::string& option) -> size_t {
+        const std::string text(value);
+        if (text.empty() || !std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c); })) {
+            throw std::runtime_error("Invalid value for " + option + ": expected a positive integer");
+        }
+        try {
+            return static_cast<size_t>(std::stoull(text));
+        } catch (const std::exception&) {
+            throw std::runtime_error("Invalid value for " + option + ": integer is out of range");
+        }
+    };
     for (int i = 1; i < argc_; ++i) {
         std::string arg = argv_[i];
         if (arg == "-i" && i + 1 < argc_) {
@@ -253,6 +268,18 @@ void ConvertApp::parseArgs() {
             else throw std::runtime_error("Invalid --lod-method: " + method + " (expected cluster or decimate)");
         } else if (arg == "--lod-debug") {
             lod_settings_.debug = true;
+        } else if (arg == "--max-leaf-splats") {
+            if (i + 1 >= argc_) throw std::runtime_error("Missing value for --max-leaf-splats");
+            lod_settings_.max_leaf_splats = parse_count(argv_[++i], "--max-leaf-splats");
+        } else if (arg == "--lcc2-payload-layout") {
+            if (i + 1 >= argc_) throw std::runtime_error("Missing value for --lcc2-payload-layout");
+            const std::string layout = argv_[++i];
+            if (layout == "level") lod_settings_.payload_layout = Lcc2PayloadLayout::Level;
+            else if (layout == "chunked") lod_settings_.payload_layout = Lcc2PayloadLayout::Chunked;
+            else throw std::runtime_error("Invalid --lcc2-payload-layout: " + layout + " (expected level or chunked)");
+        } else if (arg == "--max-payload-splats") {
+            if (i + 1 >= argc_) throw std::runtime_error("Missing value for --max-payload-splats");
+            lod_settings_.max_payload_splats = parse_count(argv_[++i], "--max-payload-splats");
         } else if (arg == "--cell-size" && i + 1 < argc_) {
             if (sscanf(argv_[++i], "%f,%f", &cell_size_x_, &cell_size_y_) != 2) {
                 throw std::runtime_error("Invalid cell-size format. Use X,Y");
@@ -300,6 +327,16 @@ void ConvertApp::parseArgs() {
 
     if (lod_settings_.generate && output_format_ != OutputFormat::Lcc2) {
         throw std::runtime_error("--generate-lod requires --format lcc2");
+    }
+    constexpr size_t kMaximumConfiguredSplats = 16777216;
+    if (lod_settings_.max_leaf_splats == 0 || lod_settings_.max_leaf_splats > kMaximumConfiguredSplats) {
+        throw std::runtime_error("--max-leaf-splats must be between 1 and 16777216");
+    }
+    if (lod_settings_.max_payload_splats == 0 || lod_settings_.max_payload_splats > kMaximumConfiguredSplats) {
+        throw std::runtime_error("--max-payload-splats must be between 1 and 16777216");
+    }
+    if (lod_settings_.payload_layout == Lcc2PayloadLayout::Chunked && !lod_settings_.generate) {
+        throw std::runtime_error("--lcc2-payload-layout chunked currently requires --generate-lod");
     }
 
     log("Input: " + input_path_.u8string() + "\n");
@@ -423,59 +460,127 @@ void ConvertApp::generateLods() {
     log("  input splats: " + std::to_string(source.size()) + "\n");
 
     LodGenerator generator(lod_settings_);
-    std::vector<LodLevel> levels = generator.generate(source.to_vector());
-    const BBox source_bbox = source.compute_bbox();
-    auto cell_index = [&](const Vec3f& pos) {
-        const int x = std::max(0, std::min(65535, static_cast<int>(std::floor((pos.x - source_bbox.min.x) / cell_size_x_))));
-        const int y = std::max(0, std::min(65535, static_cast<int>(std::floor((pos.y - source_bbox.min.y) / cell_size_y_))));
-        return (static_cast<uint32_t>(y) << 16) | static_cast<uint32_t>(x);
-    };
+    const std::vector<Splat> source_splats = source.to_vector();
+    AdaptiveLodHierarchy adaptive = generator.generate_adaptive(source_splats, lod_settings_.max_leaf_splats);
     generated_lod_dir_ = output_dir_ / ".generated_lod";
     fs::create_directories(generated_lod_dir_);
     lod_files_.clear();
     lcc2_payload_files_.clear();
-    lod_errors_.clear();
+    lod_errors_ = adaptive.errors_per_level;
     lod_stats_.clear();
-    for (size_t lod = 0; lod < levels.size(); ++lod) {
-        std::stable_sort(levels[lod].splats.begin(), levels[lod].splats.end(),
-                         [&](const Splat& a, const Splat& b) { return cell_index(a.pos) < cell_index(b.pos); });
-        const fs::path path = generated_lod_dir_ / ("lod_" + std::to_string(lod) + ".ply");
-        LodGenerator::write_binary_ply(path, levels[lod].splats, source.num_f_rest());
-        lod_files_.push_back(path);
-        lod_errors_.push_back(levels[lod].error);
-        lod_stats_.push_back(levels[lod].stats);
-        log("  LOD" + std::to_string(lod) + ": " + std::to_string(levels[lod].splats.size()) +
-            " splats, error " + std::to_string(levels[lod].error) + "\n");
-        if (lod_settings_.debug && lod + 1 < levels.size()) {
-            const auto& stats = levels[lod].stats;
-            log("    clusters: " + std::to_string(stats.cluster_count) +
-                ", avg/min/max size: " + std::to_string(stats.average_cluster_size) + "/" +
-                std::to_string(stats.min_cluster_size) + "/" + std::to_string(stats.max_cluster_size) +
-                ", mean covariance error: " + std::to_string(stats.mean_covariance_error) +
-                ", rejected merges: " + std::to_string(stats.rejected_merges) + "\n");
-        }
-    }
+    hierarchy_ = {};
+    hierarchy_.level_count = adaptive.level_count;
+    hierarchy_.splats_per_level = adaptive.splats_per_level;
+    hierarchy_.errors_per_level = adaptive.errors_per_level;
+    hierarchy_.bounds = adaptive.bounds;
+    hierarchy_.leaves.resize(adaptive.leaves.size());
+    has_generated_hierarchy_ = true;
 
-    log("  encoding SPZ v4 payloads with splat-transform\n");
-    for (size_t lod = 0; lod < lod_files_.size(); ++lod) {
-        const fs::path spz_path = generated_lod_dir_ / ("lod_" + std::to_string(lod) + ".spz");
+    std::vector<size_t> leaf_sizes;
+    leaf_sizes.reserve(adaptive.leaves.size());
+    for (const AdaptiveLodLeaf& leaf : adaptive.leaves) {
+        if (leaf.source_indices.empty()) throw std::runtime_error("Adaptive partition produced an empty leaf");
+        if (leaf.source_indices.size() > lod_settings_.max_leaf_splats) {
+            throw std::runtime_error("Adaptive partition emitted a full-detail node above --max-leaf-splats");
+        }
+        leaf_sizes.push_back(leaf.source_indices.size());
+        hierarchy_.leaves[leaf.id].id = leaf.id;
+        hierarchy_.leaves[leaf.id].bounds = leaf.bounds;
+    }
+    std::sort(leaf_sizes.begin(), leaf_sizes.end());
+    log("  leaves: " + std::to_string(leaf_sizes.size()) +
+        ", full-detail min/median/max: " + std::to_string(leaf_sizes.front()) + "/" +
+        std::to_string(leaf_sizes[leaf_sizes.size() / 2]) + "/" + std::to_string(leaf_sizes.back()) + "\n");
+
+    size_t max_payload_count = 0;
+    uintmax_t max_payload_bytes = 0;
+    for (size_t level = 0; level < adaptive.level_count; ++level) {
+        std::vector<size_t> present;
+        std::vector<Splat> complete_level;
+        size_t max_node_count = 0;
+        for (const AdaptiveLodLeaf& leaf : adaptive.leaves) {
+            const size_t first = adaptive.level_count - leaf.levels.size();
+            if (level < first) continue;
+            const LodLevel& node = leaf.levels[level - first];
+            present.push_back(leaf.id);
+            complete_level.insert(complete_level.end(), node.splats.begin(), node.splats.end());
+            max_node_count = std::max(max_node_count, node.splats.size());
+        }
+        const fs::path complete_path = generated_lod_dir_ / ("lod_" + std::to_string(level) + ".ply");
+        LodGenerator::write_binary_ply(complete_path, complete_level, source.num_f_rest());
+        lod_files_.push_back(complete_path);
+        log("  LOD" + std::to_string(level) + ": " + std::to_string(complete_level.size()) +
+            " splats, " + std::to_string(present.size()) + " nodes, max node " +
+            std::to_string(max_node_count) + ", error " + std::to_string(adaptive.errors_per_level[level]) + "\n");
+
+        std::vector<std::vector<size_t>> groups(1);
+        size_t group_count = 0;
+        for (size_t leaf_id : present) {
+            const AdaptiveLodLeaf& leaf = adaptive.leaves[leaf_id];
+            const size_t first = adaptive.level_count - leaf.levels.size();
+            const size_t count = leaf.levels[level - first].splats.size();
+            if (lod_settings_.payload_layout == Lcc2PayloadLayout::Chunked && count > lod_settings_.max_payload_splats) {
+                throw std::runtime_error("--max-payload-splats is smaller than node leaf-" +
+                                         std::to_string(leaf_id) + " at LOD" + std::to_string(level) +
+                                         "; nodes cannot be split across payloads");
+            }
+            if (lod_settings_.payload_layout == Lcc2PayloadLayout::Chunked && !groups.back().empty() &&
+                group_count + count > lod_settings_.max_payload_splats) {
+                groups.emplace_back();
+                group_count = 0;
+            }
+            groups.back().push_back(leaf_id);
+            group_count += count;
+        }
+
+        for (size_t chunk = 0; chunk < groups.size(); ++chunk) {
+            std::vector<Splat> payload_splats;
+            const size_t payload_index = hierarchy_.payloads.size();
+            for (size_t leaf_id : groups[chunk]) {
+                const AdaptiveLodLeaf& leaf = adaptive.leaves[leaf_id];
+                const size_t first = adaptive.level_count - leaf.levels.size();
+                const LodLevel& node = leaf.levels[level - first];
+                hierarchy_.leaves[leaf_id].nodes.push_back(
+                    {level, payload_index, payload_splats.size(), node.splats.size(), node.error});
+                payload_splats.insert(payload_splats.end(), node.splats.begin(), node.splats.end());
+            }
+            const std::string stem = lod_settings_.payload_layout == Lcc2PayloadLayout::Level
+                ? "lod_" + std::to_string(level)
+                : "lod_" + std::to_string(level) + "_chunk_" + std::to_string(chunk);
+            const fs::path ply_path = generated_lod_dir_ / (stem + "_payload.ply");
+            const fs::path spz_path = generated_lod_dir_ / (stem + ".spz");
+            LodGenerator::write_binary_ply(ply_path, payload_splats, source.num_f_rest());
+            log("  encoding " + stem + " as SPZ v4\n");
         const std::vector<fs::path> command{
             splat_transform_path_, "--quiet", "--overwrite", "--spz-version", "4",
-            lod_files_[lod], spz_path
+                ply_path, spz_path
         };
         const int exit_code = platform::run_process(command);
         if (exit_code != 0) {
             throw std::runtime_error(
-                "splat-transform failed while encoding LOD" + std::to_string(lod) +
+                    "splat-transform failed while encoding " + stem +
                 " as SPZ v4 (exit code " + std::to_string(exit_code) +
                 "). Install @playcanvas/splat-transform or pass --splat-transform <path>");
         }
         if (!fs::exists(spz_path)) {
             throw std::runtime_error("splat-transform did not create " + spz_path.u8string());
         }
-        Lcc2Writer::validate_spz_v4(spz_path, levels[lod].splats.size(), source.sh_degree());
-        lcc2_payload_files_.push_back(spz_path);
+            Lcc2Writer::validate_spz_v4(spz_path, payload_splats.size(), source.sh_degree());
+            hierarchy_.payloads.push_back({ply_path, spz_path, level, payload_splats.size()});
+            max_payload_count = std::max(max_payload_count, payload_splats.size());
+            max_payload_bytes = std::max(max_payload_bytes, fs::file_size(spz_path));
+        }
     }
+    for (const AdaptiveLodLeaf& leaf : adaptive.leaves) {
+        if (leaf.levels.size() < lod_settings_.levels) {
+            log("  warning: leaf-" + std::to_string(leaf.id) + " generated " +
+                std::to_string(leaf.levels.size()) + " of " + std::to_string(lod_settings_.levels) +
+                " requested levels (further reduction was not possible)\n");
+        }
+    }
+    log("  payloads: " + std::to_string(hierarchy_.payloads.size()) +
+        ", maximum payload splats/bytes: " + std::to_string(max_payload_count) + "/" +
+        std::to_string(max_payload_bytes) + "\n");
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     log("  generation time: " + std::to_string(seconds) + " seconds\n");
 }

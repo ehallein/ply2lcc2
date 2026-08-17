@@ -5,6 +5,7 @@
 
 #include <fstream>
 #include <array>
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <iomanip>
@@ -164,13 +165,48 @@ void Lcc2Writer::write(const SpatialGrid& grid,
                        const std::vector<fs::path>& payload_files,
                        const fs::path& environment_file,
                        const std::string& name,
-                       const std::vector<float>& lod_errors) {
+                       const std::vector<float>& lod_errors,
+                       const Lcc2HierarchyInfo* hierarchy) {
     if (lod_files.empty()) {
         throw std::runtime_error("LCC2 output requires at least one 3DGS PLY file");
     }
 
-    const std::vector<fs::path>& payloads = payload_files.empty() ? lod_files : payload_files;
-    if (payloads.size() != lod_files.size()) {
+    std::vector<fs::path> payloads = payload_files.empty() ? lod_files : payload_files;
+    std::vector<fs::path> payload_plys = lod_files;
+    if (hierarchy) {
+        if (hierarchy->level_count == 0 || hierarchy->leaves.empty() || hierarchy->payloads.empty()) {
+            throw std::runtime_error("Generated LCC2 hierarchy is incomplete");
+        }
+        payloads.clear();
+        payload_plys.clear();
+        for (const Lcc2PayloadInfo& payload : hierarchy->payloads) {
+            payloads.push_back(payload.payload_file);
+            payload_plys.push_back(payload.ply_file);
+        }
+        std::vector<std::vector<std::pair<size_t, size_t>>> ranges(hierarchy->payloads.size());
+        for (const Lcc2HierarchyLeafInfo& leaf : hierarchy->leaves) {
+            for (const Lcc2HierarchyNodeInfo& node : leaf.nodes) {
+                if (node.count == 0 || node.payload_index >= ranges.size()) {
+                    throw std::runtime_error("Generated hierarchy contains an empty node or invalid payload reference");
+                }
+                ranges[node.payload_index].push_back({node.start, node.count});
+            }
+        }
+        for (size_t payload_index = 0; payload_index < ranges.size(); ++payload_index) {
+            auto& payload_ranges = ranges[payload_index];
+            std::sort(payload_ranges.begin(), payload_ranges.end());
+            size_t cursor = 0;
+            for (const auto& range : payload_ranges) {
+                if (range.first != cursor) {
+                    throw std::runtime_error("Generated hierarchy payload ranges are not contiguous");
+                }
+                cursor += range.second;
+            }
+            if (cursor != hierarchy->payloads[payload_index].splat_count) {
+                throw std::runtime_error("Generated hierarchy payload ranges do not cover the payload exactly");
+            }
+        }
+    } else if (payloads.size() != lod_files.size()) {
         throw std::runtime_error("LCC2 payload count must match the number of LOD files");
     }
     if (!lod_errors.empty() && lod_errors.size() != lod_files.size()) {
@@ -195,21 +231,25 @@ void Lcc2Writer::write(const SpatialGrid& grid,
 
     std::vector<size_t> lod_counts;
     std::vector<std::string> relative_files;
-    lod_counts.reserve(lod_files.size());
-    relative_files.reserve(lod_files.size() + 1);
+    lod_counts.reserve(hierarchy ? hierarchy->level_count : lod_files.size());
+    relative_files.reserve(payloads.size() + 1);
+
+    if (hierarchy) lod_counts = hierarchy->splats_per_level;
 
     size_t total_splats = 0;
-    for (size_t lod = 0; lod < lod_files.size(); ++lod) {
+    for (size_t payload_index = 0; payload_index < payloads.size(); ++payload_index) {
         SplatBuffer splats;
-        if (!splats.initialize(lod_files[lod])) {
-            throw std::runtime_error("Failed to inspect " + lod_files[lod].u8string() + ": " + splats.error());
+        if (!splats.initialize(payload_plys[payload_index])) {
+            throw std::runtime_error("Failed to inspect " + payload_plys[payload_index].u8string() + ": " + splats.error());
         }
 
         if (splat_extension == ".spz") {
-            validate_spz_v4(payloads[lod], splats.size(), splats.sh_degree());
+            validate_spz_v4(payloads[payload_index], splats.size(), splats.sh_degree());
         }
 
-        const std::string filename = "lod_" + std::to_string(lod) + splat_extension;
+        const std::string filename = hierarchy
+            ? payloads[payload_index].stem().u8string() + splat_extension
+            : "lod_" + std::to_string(payload_index) + splat_extension;
         const fs::path destination = splat_dir / filename;
         if (splat_extension == ".spz") {
             const std::vector<fs::path> command{
@@ -217,22 +257,22 @@ void Lcc2Writer::write(const SpatialGrid& grid,
                 // splat-transform rotations are expressed in engine space. Its
                 // PLY/SPZ source transform includes a 180-degree Z rotation, so
                 // +90 here produces the required -90 X rotation in raw payload space.
-                payloads[lod], "--rotate", "90,0,0", destination
+                payloads[payload_index], "--rotate", "90,0,0", destination
             };
             const int exit_code = platform::run_process(command);
             if (exit_code != 0) {
                 throw std::runtime_error(
-                    "splat-transform failed while rotating LCC2 payload " + payloads[lod].u8string() +
+                    "splat-transform failed while rotating LCC2 payload " + payloads[payload_index].u8string() +
                     " (exit code " + std::to_string(exit_code) + ")");
             }
             validate_spz_v4(destination, splats.size(), splats.sh_degree());
         } else {
-            write_transformed_ply(payloads[lod], destination);
+            write_transformed_ply(payloads[payload_index], destination);
         }
         relative_files.push_back("data/3dgs/" + filename);
-        lod_counts.push_back(splats.size());
-        total_splats += splats.size();
+        if (!hierarchy) lod_counts.push_back(splats.size());
     }
+    for (size_t count : lod_counts) total_splats += count;
 
     bool has_environment = !environment_file.empty() && fs::exists(environment_file);
     size_t environment_count = 0;
@@ -272,17 +312,18 @@ void Lcc2Writer::write(const SpatialGrid& grid,
              << "\t\"lodSplats\": [";
     for (size_t i = 0; i < lod_counts.size(); ++i) {
         if (i != 0) metadata << ", ";
-        const size_t lod = lod_errors.empty() ? i : lod_counts.size() - 1 - i;
+        const size_t lod = (lod_errors.empty() && !hierarchy) ? i : lod_counts.size() - 1 - i;
         metadata << lod_counts[lod];
     }
     metadata << "],\n"
              << "\t\"totalLevels\": " << lod_counts.size() << ",\n"
              << "\t\"virtualLoD\": null,\n";
-    if (!lod_errors.empty()) {
+    if (!lod_errors.empty() || hierarchy) {
+        const std::vector<float>& errors = hierarchy ? hierarchy->errors_per_level : lod_errors;
         metadata << "\t\"lodErrors\": [";
-        for (size_t i = 0; i < lod_errors.size(); ++i) {
+        for (size_t i = 0; i < errors.size(); ++i) {
             if (i != 0) metadata << ", ";
-            metadata << lod_errors[lod_errors.size() - 1 - i];
+            metadata << errors[errors.size() - 1 - i];
         }
         metadata << "],\n";
     }
@@ -304,10 +345,11 @@ void Lcc2Writer::write(const SpatialGrid& grid,
              << "\t\"root\": {\n"
              << "\t\t\"id\": \"0\",\n"
              << "\t\t\"boundingBox\": ";
-    const BBox lcc2_scene_bbox = to_lcc2_bbox(grid.bbox());
+    const BBox lcc2_scene_bbox = to_lcc2_bbox(hierarchy ? hierarchy->bounds : grid.bbox());
     write_bbox(metadata, lcc2_scene_bbox, 2);
     metadata << ",\n"
-             << "\t\t\"childNum\": " << (lod_errors.empty() ? lod_files.size() : grid.cells().size()) << ",\n"
+             << "\t\t\"childNum\": " << (hierarchy ? hierarchy->leaves.size() :
+                    (lod_errors.empty() ? lod_files.size() : grid.cells().size())) << ",\n"
              << "\t\t\"data\": ";
     if (has_environment) {
         metadata << "{\"env\": {\"name\": " << environment_file_index << "}}";
@@ -323,7 +365,43 @@ void Lcc2Writer::write(const SpatialGrid& grid,
     metadata << "],\n"
              << "\t\t\"child\": {\n";
 
-    if (lod_errors.empty()) {
+    if (hierarchy) {
+        for (size_t leaf_index = 0; leaf_index < hierarchy->leaves.size(); ++leaf_index) {
+            const Lcc2HierarchyLeafInfo& leaf = hierarchy->leaves[leaf_index];
+            if (leaf.nodes.empty()) throw std::runtime_error("Generated hierarchy leaf has no LOD nodes");
+            const BBox leaf_bbox = to_lcc2_bbox(leaf.bounds);
+            metadata << "\t\t\t\"" << leaf_index << "\": {\n"
+                     << "\t\t\t\t\"id\": \"leaf-" << leaf.id << "\",\n"
+                     << "\t\t\t\t\"boundingBox\": ";
+            write_bbox(metadata, leaf_bbox, 4);
+            std::function<void(size_t, int)> write_node;
+            write_node = [&](size_t depth, int indent) {
+                const Lcc2HierarchyNodeInfo& node = leaf.nodes[depth];
+                if (node.payload_index >= hierarchy->payloads.size() ||
+                    node.start + node.count > hierarchy->payloads[node.payload_index].splat_count) {
+                    throw std::runtime_error("Generated hierarchy node range is outside its payload");
+                }
+                const std::string pad(static_cast<size_t>(indent), '\t');
+                metadata << ",\n" << pad << "\"lodLevel\": " << (hierarchy->level_count - 1 - node.level)
+                         << ",\n" << pad << "\"lodError\": " << node.error
+                         << ",\n" << pad << "\"childNum\": " << (depth + 1 < leaf.nodes.size() ? 1 : 0)
+                         << ",\n" << pad << "\"data\": {\"3dgs\": {\"name\": " << node.payload_index
+                         << ", \"start\": " << node.start << ", \"count\": " << node.count << "}}";
+                if (depth + 1 < leaf.nodes.size()) {
+                    const auto& child = leaf.nodes[depth + 1];
+                    metadata << ",\n" << pad << "\"child\": {\n"
+                             << pad << "\t\"" << child.level << "\": {\n"
+                             << pad << "\t\t\"id\": \"leaf-" << leaf.id << "-lod-" << child.level << "\",\n"
+                             << pad << "\t\t\"boundingBox\": ";
+                    write_bbox(metadata, leaf_bbox, indent + 2);
+                    write_node(depth + 1, indent + 2);
+                    metadata << "\n" << pad << "\t}\n" << pad << "}";
+                }
+            };
+            write_node(0, 4);
+            metadata << "\n\t\t\t}" << (leaf_index + 1 == hierarchy->leaves.size() ? "\n" : ",\n");
+        }
+    } else if (lod_errors.empty()) {
         for (size_t lod = 0; lod < lod_files.size(); ++lod) {
             metadata << "\t\t\t\"" << lod << "\": {\n"
                      << "\t\t\t\t\"id\": \"0-" << lod << "\",\n"

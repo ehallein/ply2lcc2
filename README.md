@@ -59,6 +59,28 @@ Then generate a deterministic hierarchy from a PLY:
   --generate-lod --lod-levels 5 --lod-reduction 4 --lod-method cluster
 ```
 
+Generated hierarchies partition the original source first. By default, every
+independently selectable leaf contains at most 65,536 full-detail splats:
+
+```bash
+./ply2lcc2 -i garden.ply -o garden_lcc2 --format lcc2 \
+  --generate-lod --max-leaf-splats 65536
+```
+
+All representations in a leaf derive exclusively from that leaf's fixed source
+membership. The default `level` layout keeps one SPZ per detail rank. The
+opt-in `chunked` layout groups complete node representations into bounded files:
+
+```bash
+./ply2lcc2 -i garden.ply -o garden_lcc2_chunked --format lcc2 \
+  --generate-lod --max-leaf-splats 65536 \
+  --lcc2-payload-layout chunked --max-payload-splats 262144
+```
+
+QuestSplat currently assumes one payload file per rank. Do not use chunked
+packages there until its reader supports each node's `data.3dgs.name` file
+index and range independently, including multiple files at one rank.
+
 If `splat-transform` is not on `PATH`, pass its executable explicitly:
 
 ```bash
@@ -75,12 +97,14 @@ preserves the complete source SH data.
 
 `cluster` uses spatial Morton ordering, a colour similarity threshold, weighted
 centroids, accumulated alpha, and covariance moment matching. `decimate` uses
-spatially stratified importance selection. Generated metadata partitions every
-level into contiguous spatial-cell ranges and stores `lodError` as the maximum
+spatially stratified importance selection. Generated metadata concatenates
+adaptive leaves in stable order at every level and stores `lodError` as the maximum
 centre displacement plus representative-radius difference introduced by that
 level (accumulated toward coarser levels). Canonical LCC2 metadata is written
 finest-first, while the spatial tree nests progressively finer data below each
-coarse cell node.
+coarse leaf node. Leaf bounds conservatively include three times the largest
+Gaussian principal scale on every world axis and remain identical throughout a
+leaf's chain.
 
 The generated directory has this structure:
 
@@ -152,6 +176,12 @@ This builds both the CLI (`ply2lcc2`) and GUI (`ply2lcc-gui`) executables.
 | `--lod-reduction <n>` | Approximate reduction factor per level | 4 |
 | `--lod-method cluster\|decimate` | LOD generation strategy | `cluster` |
 | `--lod-debug` | Print cluster size/error/rejection details | false |
+| `--max-leaf-splats <n>` | Maximum full-detail splats in a generated adaptive leaf | 65536 |
+| `--lcc2-payload-layout level\|chunked` | One payload per rank or bounded multi-file ranks | `level` |
+| `--max-payload-splats <n>` | Maximum splats per chunked payload; nodes are never split | 262144 |
+
+See [Adaptive LCC2 hierarchy design](docs/adaptive-lcc2-hierarchy.md) for the
+partition, bounds, error, and streaming contracts.
 
 ## LCC2 attribution
 
