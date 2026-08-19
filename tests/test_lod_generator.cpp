@@ -39,6 +39,26 @@ TEST(LodGeneratorTest, WeightedCentroidOfEqualGaussiansIsMidpoint) {
     EXPECT_NEAR(merged.pos.y, 0.0f, 1e-5f);
 }
 
+TEST(LodGeneratorTest, ErrorUsesOpacityWeightedPositionPercentile) {
+    std::vector<Splat> source;
+    for (int i = 0; i < 19; ++i)
+        source.push_back(make_splat(0, 0, 0, 1, 1, 1, 0.5f, 0.1f));
+    source.push_back(make_splat(100, 0, 0, 1, 1, 1, 0.000001f, 0.1f));
+
+    float error = 0.0f;
+    const std::vector<size_t> indices{0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                                      10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+    LodGenerator::merge_cluster(source, indices,
+                                &error);
+    EXPECT_LT(error, 0.01f);
+
+    source.back().pos = Vec3f(0, 0, 0);
+    source.back().scale = Vec3f(std::log(100.0f), std::log(100.0f), std::log(100.0f));
+    error = 1.0f;
+    LodGenerator::merge_cluster(source, indices, &error);
+    EXPECT_FLOAT_EQ(error, 0.0f);
+}
+
 TEST(LodGeneratorTest, MomentMatchedCovarianceExpandsAlongSeparationAxis) {
     const std::vector<Splat> source{make_splat(-1, 0, 0, 1, 1, 1),
                                     make_splat(1, 0, 0, 1, 1, 1)};

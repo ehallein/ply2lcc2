@@ -35,6 +35,11 @@ struct OrderedSplat {
     size_t index;
 };
 
+struct WeightedError {
+    float value;
+    double weight;
+};
+
 double sqr(double value) { return value * value; }
 
 Vec3f rgb(const Splat& splat) {
@@ -201,6 +206,58 @@ std::vector<OrderedSplat> morton_order(const std::vector<Splat>& splats) {
 
 float point_distance(const Vec3f& a, const Vec3f& b) {
     return std::sqrt(static_cast<float>(sqr(a.x - b.x) + sqr(a.y - b.y) + sqr(a.z - b.z)));
+}
+
+float weightedPositionalError(const std::vector<Splat>& splats,
+                              const std::vector<size_t>& indices,
+                              const Splat& representative) {
+    std::vector<WeightedError> errors;
+    errors.reserve(indices.size());
+    double total_weight = 0.0;
+    for (size_t index : indices) {
+        const Splat& source = splats[index];
+        const double weight = std::max(kEpsilon, static_cast<double>(sigmoid(source.opacity)));
+        errors.push_back({point_distance(source.pos, representative.pos), weight});
+        total_weight += weight;
+    }
+    std::sort(errors.begin(), errors.end(),
+              [](const WeightedError& left, const WeightedError& right) {
+                  return left.value < right.value;
+              });
+    const double target = total_weight * 0.95;
+    double accumulated = 0.0;
+    for (const WeightedError& error : errors) {
+        accumulated += error.weight;
+        if (accumulated >= target) return error.value;
+    }
+    return errors.empty() ? 0.0f : errors.back().value;
+}
+
+float weightedRepresentationError(const std::vector<Splat>& source,
+                                   const std::vector<Splat>& representatives) {
+    if (source.empty() || representatives.empty()) return 0.0f;
+    std::vector<WeightedError> errors;
+    errors.reserve(source.size());
+    double total_weight = 0.0;
+    for (const Splat& original : source) {
+        float nearest = std::numeric_limits<float>::max();
+        for (const Splat& representative : representatives)
+            nearest = std::min(nearest, point_distance(original.pos, representative.pos));
+        const double weight = std::max(kEpsilon, static_cast<double>(sigmoid(original.opacity)));
+        errors.push_back({nearest, weight});
+        total_weight += weight;
+    }
+    std::sort(errors.begin(), errors.end(),
+              [](const WeightedError& left, const WeightedError& right) {
+                  return left.value < right.value;
+              });
+    const double target = total_weight * 0.95;
+    double accumulated = 0.0;
+    for (const WeightedError& error : errors) {
+        accumulated += error.weight;
+        if (accumulated >= target) return error.value;
+    }
+    return errors.back().value;
 }
 
 float logit(float alpha) {
@@ -434,6 +491,12 @@ SpatialLodHierarchy LodGenerator::generate_spatial(const std::vector<Splat>& sou
             if (node.representation.splats.size() >= child_splats ||
                 node.representation.error <= child_error) {
                 node.representation = decimate(node_source);
+                while (node.representation.splats.size() >= child_splats &&
+                       node.representation.splats.size() > 1) {
+                    node.representation = decimate(node.representation.splats);
+                }
+                node.representation.error =
+                    weightedRepresentationError(node_source, node.representation.splats);
             }
             node.representation.error = std::max(node.representation.error, child_error);
         }
@@ -513,6 +576,7 @@ SpatialLodHierarchy LodGenerator::generate_spatial(const std::vector<Splat>& sou
 std::vector<LodLevel> LodGenerator::generate(std::vector<Splat> source) const {
     if (source.empty()) throw std::runtime_error("Cannot generate LODs from an empty scene");
     validate(source, "source LOD");
+    const std::vector<Splat> original_source = source;
     std::vector<LodLevel> fine_to_coarse;
     LodLevel original;
     original.splats = std::move(source);
@@ -527,7 +591,7 @@ std::vector<LodLevel> LodGenerator::generate(std::vector<Splat> source) const {
             break;
         }
         validate(next.splats, "generated LOD");
-        next.error += fine_to_coarse.back().error;
+        next.error = weightedRepresentationError(original_source, next.splats);
         fine_to_coarse.push_back(std::move(next));
     }
     std::reverse(fine_to_coarse.begin(), fine_to_coarse.end());
@@ -552,12 +616,10 @@ LodLevel LodGenerator::decimate(const std::vector<Splat>& source) const {
             if (score > best_importance) { best = candidate; best_importance = score; }
         }
         level.splats.push_back(source[best]);
-        float bucket_error = 0.0f;
-        for (size_t i = begin; i < end; ++i) {
-            const Splat& item = source[ordered[i].index];
-            bucket_error = std::max(bucket_error, point_distance(item.pos, source[best].pos) +
-                                    std::abs(max_scale(item) - max_scale(source[best])));
-        }
+        std::vector<size_t> bucket_indices;
+        bucket_indices.reserve(end - begin);
+        for (size_t i = begin; i < end; ++i) bucket_indices.push_back(ordered[i].index);
+        const float bucket_error = weightedPositionalError(source, bucket_indices, source[best]);
         level.error = std::max(level.error, bucket_error);
         error_sum += bucket_error;
     }
@@ -626,8 +688,9 @@ LodLevel LodGenerator::cluster(const std::vector<Splat>& source) const {
             }
         }
         for (const auto& group : groups) {
-            float error = 0.0f;
-            level.splats.push_back(merge_cluster(source, group, &error));
+            Splat representative = merge_cluster(source, group);
+            const float error = weightedPositionalError(source, group, representative);
+            level.splats.push_back(std::move(representative));
             level.error = std::max(level.error, error);
             error_sum += error;
             level.stats.min_cluster_size = std::min(level.stats.min_cluster_size, group.size());
@@ -697,12 +760,7 @@ Splat LodGenerator::merge_cluster(const std::vector<Splat>& splats,
     result.rot[0] = rotation.w; result.rot[1] = rotation.x;
     result.rot[2] = rotation.y; result.rot[3] = rotation.z;
 
-    float max_error = 0.0f;
-    for (size_t index : indices) {
-        max_error = std::max(max_error, point_distance(splats[index].pos, result.pos) +
-                             std::abs(max_scale(splats[index]) - max_scale(result)));
-    }
-    if (error) *error = max_error;
+    if (error) *error = weightedPositionalError(splats, indices, result);
     return result;
 }
 
