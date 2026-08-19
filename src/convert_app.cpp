@@ -526,6 +526,16 @@ void ConvertApp::generateLods() {
     log("  leaves: " + std::to_string(leaf_sizes.size()) +
         ", full-detail min/median/max: " + std::to_string(leaf_sizes.front()) + "/" +
         std::to_string(leaf_sizes[leaf_sizes.size() / 2]) + "/" + std::to_string(leaf_sizes.back()) + "\n");
+    auto overlap_line = [&](const char* label, const SpatialOverlapStats& stats) {
+        const double percent = stats.pair_count == 0 ? 0.0 :
+            100.0 * static_cast<double>(stats.overlap_count) / static_cast<double>(stats.pair_count);
+        log("  " + std::string(label) + " overlap: " + std::to_string(stats.overlap_count) + "/" +
+            std::to_string(stats.pair_count) + " pairs (" + std::to_string(percent) +
+            "%), total/max volume " + std::to_string(stats.total_overlap_volume) + "/" +
+            std::to_string(stats.max_overlap_volume) + "\n");
+    };
+    overlap_line("sibling", spatial.sibling_overlap);
+    overlap_line("leaf", spatial.leaf_overlap);
 
     size_t max_payload_count = 0;
     uintmax_t max_payload_bytes = 0;

@@ -233,6 +233,13 @@ TEST(LodGeneratorTest, SpatialHierarchyBranchesAndPreservesMembership) {
     const auto hierarchy = generator.generate_spatial(source);
 
     EXPECT_GT(hierarchy.nodes_per_level.back().size(), hierarchy.roots.size());
+    EXPECT_EQ(hierarchy.sibling_overlap.overlap_count, 0u);
+    EXPECT_EQ(hierarchy.leaf_overlap.overlap_count, 0u);
+    std::vector<size_t> ownership(source.size(), 0);
+    for (size_t leaf_id : hierarchy.nodes_per_level.back()) {
+        for (size_t index : hierarchy.nodes[leaf_id].source_indices) ++ownership[index];
+    }
+    EXPECT_TRUE(std::all_of(ownership.begin(), ownership.end(), [](size_t count) { return count == 1; }));
     size_t unary = 0;
     for (const auto& node : hierarchy.nodes) {
         if (node.children.size() == 1) ++unary;

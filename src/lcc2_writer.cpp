@@ -210,11 +210,45 @@ void Lcc2Writer::write(const SpatialGrid& grid,
             payload_plys.push_back(payload.ply_file);
         }
         std::vector<std::vector<std::pair<size_t, size_t>>> ranges(hierarchy->payloads.size());
+        auto bounds_overlap_in_volume = [](const BBox& a, const BBox& b) {
+            for (int axis = 0; axis < 3; ++axis) {
+                if (!(std::min(a.max[axis], b.max[axis]) >
+                      std::max(a.min[axis], b.min[axis]))) return false;
+            }
+            return true;
+        };
+        for (size_t i = 0; i < hierarchy->roots.size(); ++i) {
+            if (hierarchy->roots[i] >= hierarchy->nodes.size()) {
+                throw std::runtime_error("Generated hierarchy has an invalid root reference");
+            }
+            for (size_t j = i + 1; j < hierarchy->roots.size(); ++j) {
+                if (hierarchy->roots[j] >= hierarchy->nodes.size()) {
+                    throw std::runtime_error("Generated hierarchy has an invalid root reference");
+                }
+                if (bounds_overlap_in_volume(hierarchy->nodes[hierarchy->roots[i]].bounds,
+                                             hierarchy->nodes[hierarchy->roots[j]].bounds)) {
+                    throw std::runtime_error("Generated hierarchy root bounds overlap in volume");
+                }
+            }
+        }
         for (const Lcc2HierarchyNodeInfo& node : hierarchy->nodes) {
             if (node.count == 0 || node.payload_index >= ranges.size()) {
                 throw std::runtime_error("Generated hierarchy contains an empty node or invalid payload reference");
             }
             ranges[node.payload_index].push_back({node.start, node.count});
+            for (size_t i = 0; i < node.children.size(); ++i) {
+                for (size_t j = i + 1; j < node.children.size(); ++j) {
+                    if (node.children[i] >= hierarchy->nodes.size() ||
+                        node.children[j] >= hierarchy->nodes.size()) {
+                        throw std::runtime_error("Generated hierarchy has an invalid child reference");
+                    }
+                    const BBox& a = hierarchy->nodes[node.children[i]].bounds;
+                    const BBox& b = hierarchy->nodes[node.children[j]].bounds;
+                    if (bounds_overlap_in_volume(a, b)) {
+                        throw std::runtime_error("Generated hierarchy sibling bounds overlap in volume");
+                    }
+                }
+            }
             for (size_t child_id : node.children) {
                 if (child_id >= hierarchy->nodes.size() ||
                     hierarchy->nodes[child_id].level != node.level + 1) {

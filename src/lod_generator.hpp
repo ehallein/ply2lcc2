@@ -53,6 +53,13 @@ struct SpatialLodNode {
     LodLevel representation;
 };
 
+struct SpatialOverlapStats {
+    size_t pair_count = 0;
+    size_t overlap_count = 0;
+    double total_overlap_volume = 0.0;
+    double max_overlap_volume = 0.0;
+};
+
 struct SpatialLodHierarchy {
     std::vector<SpatialLodNode> nodes;
     std::vector<size_t> roots;
@@ -61,6 +68,8 @@ struct SpatialLodHierarchy {
     std::vector<size_t> splats_per_level;
     std::vector<float> errors_per_level;
     BBox bounds;
+    SpatialOverlapStats sibling_overlap;
+    SpatialOverlapStats leaf_overlap;
 };
 
 class LodGenerator {

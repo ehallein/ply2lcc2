@@ -6,10 +6,13 @@ Generated LCC2 output partitions the original full-detail splats before any
 clustering or decimation. Starting with source indices in PLY order, the
 partitioner repeatedly chooses the longest centre-bounds axis, stably sorts by
 that coordinate and original source index, and splits the count at its midpoint.
+The complete kd-tree ancestry is retained for the render hierarchy; leaves are
+never regrouped later by ID or count.
 The low half is visited before the high half. This gives stable leaf IDs and
 ordering, avoids empty children, and guarantees progress. If all centres are
 coincident, the source-index tie-break still divides the count deterministically;
-the resulting leaves intentionally have overlapping spatial bounds.
+the source-index tie-break still gives unique ownership. Degenerate coincident
+cells can touch but have no positive-volume overlap.
 
 Splitting stops when a leaf contains at most `--max-leaf-splats` source splats
 (8,192 by default). `--max-node-diagonal` can request additional extent-driven
@@ -18,10 +21,8 @@ take precedence. Generation fails if the finest-node count invariant is violated
 
 ## Fixed-membership invariant
 
-Finest leaves are grouped bottom-up over the configured ranks. Adjacent leaves
-are paired; when a level has an odd count, one three-child parent avoids leaving
-a unary branch. A unary promotion is emitted only when a level genuinely has a
-single spatial node. Each parent owns the exact union of its children's original
+The configured ranks are cut directly from the kd-tree. Each parent owns the
+exact union of its children's original
 source indices, and its approximation is generated only from that union. Thus
 atomic parent-to-visible-children replacement preserves content while allowing
 different child regions to refine independently.
@@ -33,13 +34,12 @@ the limit. This trades some coarse-rank payload size for bounded runtime jumps.
 
 ## Bounds and error
 
-A finest bound is computed from its full-detail membership. For each Gaussian,
-it expands the centre by three times the
-largest principal standard deviation on all three world axes. This spherical
-envelope is conservative under rotation and corresponds to a three-sigma
-(99.7% one-dimensional) support assumption. It also keeps each leaf's vertical
-extent local. Internal bounds are exact unions of child bounds, so children are
-contained by their parents and bounds shrink toward finer descendants.
+The root bound is the conservative three-sigma scene envelope. Every kd split
+clips that parent cell into low and high child cells at a position-derived split
+plane. Children are contained by their parent and sibling cells may touch at the
+plane, but cannot overlap in positive volume. Conversion reports sibling-pair
+and finest-leaf overlap counts and volumes, and refuses to emit an overlapping
+hierarchy.
 
 Per-node `lodError` retains the existing accumulated maximum of centre
 displacement plus representative-radius difference, in source coordinate units.

@@ -34,3 +34,5 @@ release/
 build_release/
 tools/
 .worktrees/
+
+node_modules/

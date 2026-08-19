@@ -96,6 +96,13 @@ TEST_F(PlatformTest, Fopen) {
     fclose(f);
 }
 
+TEST_F(PlatformTest, ResolveExecutableFromRepoNodeModules) {
+    const auto resolved = platform::resolve_executable("splat-transform");
+    EXPECT_FALSE(resolved.empty());
+    EXPECT_TRUE(fs::exists(resolved));
+    EXPECT_TRUE(resolved.filename().string() == "splat-transform" || resolved.filename().string() == "splat-transform.cmd");
+}
+
 // Unicode path tests - verify Korean/CJK characters work on all platforms
 class UnicodePlatformTest : public ::testing::Test {
 protected:

@@ -293,10 +293,30 @@ SpatialLodHierarchy LodGenerator::generate_spatial(const std::vector<Splat>& sou
     if (settings_.max_leaf_splats == 0) throw std::runtime_error("--max-leaf-splats must be greater than zero");
     validate(source, "source LOD");
 
-    std::vector<std::vector<size_t>> leaf_memberships;
+    struct PartitionNode {
+        std::vector<size_t> source_indices;
+        BBox bounds;
+        size_t depth = 0;
+        std::vector<size_t> children;
+    };
+
+    // The partition bounds are spatial cells, not Gaussian support bounds. The
+    // root remains conservative, while every child cell is clipped at its
+    // parent's kd split plane. Consequently siblings can touch, but cannot
+    // overlap in volume.
+    BBox root_bounds;
+    for (const Splat& splat : source) {
+        const float radius = kBoundsSigma * max_scale(splat);
+        root_bounds.expand(Vec3f(splat.pos.x - radius, splat.pos.y - radius, splat.pos.z - radius));
+        root_bounds.expand(Vec3f(splat.pos.x + radius, splat.pos.y + radius, splat.pos.z + radius));
+    }
+
+    std::vector<PartitionNode> partition;
     std::vector<size_t> all(source.size());
     std::iota(all.begin(), all.end(), size_t{0});
-    std::function<void(std::vector<size_t>)> split = [&](std::vector<size_t> indices) {
+    size_t max_partition_depth = 0;
+    std::function<size_t(std::vector<size_t>, const BBox&, size_t)> split =
+        [&](std::vector<size_t> indices, const BBox& cell, size_t depth) -> size_t {
         BBox centers;
         for (size_t index : indices) centers.expand(source[index].pos);
         const double dx = static_cast<double>(centers.max.x) - centers.min.x;
@@ -307,26 +327,40 @@ SpatialLodHierarchy LodGenerator::generate_spatial(const std::vector<Splat>& sou
         const bool over_extent = settings_.max_node_diagonal > 0.0f &&
             diagonal > settings_.max_node_diagonal &&
             indices.size() >= 2 * settings_.min_split_splats;
+        const size_t node_id = partition.size();
+        partition.push_back({std::move(indices), cell, depth, {}});
+        max_partition_depth = std::max(max_partition_depth, depth);
         if (!over_count && !over_extent) {
-            leaf_memberships.push_back(std::move(indices));
-            return;
+            return node_id;
         }
         const double extent[3] = {dx, dy, dz};
         int axis = 0;
         if (extent[1] > extent[axis]) axis = 1;
         if (extent[2] > extent[axis]) axis = 2;
-        std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+        std::vector<size_t>& members = partition[node_id].source_indices;
+        std::stable_sort(members.begin(), members.end(), [&](size_t a, size_t b) {
             const float av = source[a].pos[axis], bv = source[b].pos[axis];
             return av < bv || (av == bv && a < b);
         });
-        const size_t middle = indices.size() / 2;
-        if (middle == 0 || middle == indices.size()) {
+        const size_t middle = members.size() / 2;
+        if (middle == 0 || middle == members.size()) {
             throw std::runtime_error("Spatial LOD partition failed to make progress");
         }
-        split(std::vector<size_t>(indices.begin(), indices.begin() + static_cast<ptrdiff_t>(middle)));
-        split(std::vector<size_t>(indices.begin() + static_cast<ptrdiff_t>(middle), indices.end()));
+        std::vector<size_t> low(members.begin(), members.begin() + static_cast<ptrdiff_t>(middle));
+        std::vector<size_t> high(members.begin() + static_cast<ptrdiff_t>(middle), members.end());
+        const float low_max = source[low.back()].pos[axis];
+        const float high_min = source[high.front()].pos[axis];
+        const float split_plane = low_max + (high_min - low_max) * 0.5f;
+        BBox low_cell = cell;
+        BBox high_cell = cell;
+        low_cell.max[axis] = split_plane;
+        high_cell.min[axis] = split_plane;
+        const size_t low_id = split(std::move(low), low_cell, depth + 1);
+        const size_t high_id = split(std::move(high), high_cell, depth + 1);
+        partition[node_id].children = {low_id, high_id};
+        return node_id;
     };
-    split(std::move(all));
+    const size_t partition_root = split(std::move(all), root_bounds, 0);
 
     SpatialLodHierarchy hierarchy;
     hierarchy.level_count = settings_.levels;
@@ -334,88 +368,145 @@ SpatialLodHierarchy LodGenerator::generate_spatial(const std::vector<Splat>& sou
     hierarchy.splats_per_level.assign(settings_.levels, 0);
     hierarchy.errors_per_level.assign(settings_.levels, 0.0f);
     const size_t finest_level = settings_.levels - 1;
-    std::vector<size_t> current;
-    for (std::vector<size_t>& membership : leaf_memberships) {
-        SpatialLodNode node;
-        node.id = hierarchy.nodes.size();
-        node.level = finest_level;
-        node.source_indices = std::move(membership);
-        node.representation.splats.reserve(node.source_indices.size());
-        for (size_t index : node.source_indices) {
-            const Splat& splat = source[index];
-            node.representation.splats.push_back(splat);
-            const float radius = kBoundsSigma * max_scale(splat);
-            node.bounds.expand(Vec3f(splat.pos.x - radius, splat.pos.y - radius, splat.pos.z - radius));
-            node.bounds.expand(Vec3f(splat.pos.x + radius, splat.pos.y + radius, splat.pos.z + radius));
+    const size_t root_depth = max_partition_depth > finest_level
+        ? max_partition_depth - finest_level : 0;
+    std::vector<size_t> partition_roots;
+    std::function<void(size_t)> collect_roots = [&](size_t partition_id) {
+        const PartitionNode& node = partition[partition_id];
+        if (node.depth >= root_depth || node.children.empty()) {
+            partition_roots.push_back(partition_id);
+            return;
         }
-        node.representation.stats.input_count = node.source_indices.size();
-        node.representation.stats.output_count = node.source_indices.size();
-        current.push_back(node.id);
-        hierarchy.nodes_per_level[finest_level].push_back(node.id);
-        hierarchy.nodes.push_back(std::move(node));
-    }
+        for (size_t child : node.children) collect_roots(child);
+    };
+    collect_roots(partition_root);
 
-    for (size_t level = finest_level; level-- > 0;) {
-        std::vector<std::vector<size_t>> groups;
-        size_t cursor = 0;
-        if (current.size() > 1 && current.size() % 2 == 1) {
-            groups.push_back({current[0], current[1], current[2]});
-            cursor = 3;
-        }
-        while (cursor < current.size()) {
-            const size_t remaining = current.size() - cursor;
-            if (remaining == 1) groups.push_back({current[cursor++]});
-            else {
-                groups.push_back({current[cursor], current[cursor + 1]});
-                cursor += 2;
+    // Emit bottom-up so IDs remain deterministic and payload ordering remains
+    // compatible. Every output edge follows an actual kd-tree edge. A terminal
+    // singleton may be promoted through remaining ranks, but its membership and
+    // cell never change.
+    std::function<size_t(size_t, size_t)> emit = [&](size_t partition_id, size_t level) -> size_t {
+        const PartitionNode& spatial = partition[partition_id];
+        std::vector<size_t> children;
+        if (level < finest_level) {
+            if (spatial.children.empty()) {
+                children.push_back(emit(partition_id, level + 1));
+            } else {
+                for (size_t child : spatial.children) children.push_back(emit(child, level + 1));
             }
         }
 
-        std::vector<size_t> parents;
-        parents.reserve(groups.size());
-        for (const std::vector<size_t>& children : groups) {
-            SpatialLodNode parent;
-            parent.id = hierarchy.nodes.size();
-            parent.level = level;
-            parent.children = children;
+        SpatialLodNode node;
+        node.id = hierarchy.nodes.size();
+        node.level = level;
+        node.source_indices = spatial.source_indices;
+        node.children = std::move(children);
+        node.bounds = spatial.bounds;
+        if (level == finest_level) {
+            node.representation.splats.reserve(node.source_indices.size());
+            for (size_t index : node.source_indices) node.representation.splats.push_back(source[index]);
+            node.representation.stats.input_count = node.source_indices.size();
+            node.representation.stats.output_count = node.source_indices.size();
+        } else {
             size_t child_splats = 0;
             float child_error = 0.0f;
-            for (size_t child_id : children) {
+            for (size_t child_id : node.children) {
                 const SpatialLodNode& child = hierarchy.nodes[child_id];
-                parent.source_indices.insert(parent.source_indices.end(),
-                                             child.source_indices.begin(), child.source_indices.end());
-                parent.bounds.expand(child.bounds);
                 child_splats += child.representation.splats.size();
                 child_error = std::max(child_error, child.representation.error);
             }
             std::vector<Splat> node_source;
-            node_source.reserve(parent.source_indices.size());
-            for (size_t index : parent.source_indices) node_source.push_back(source[index]);
+            node_source.reserve(node.source_indices.size());
+            for (size_t index : node.source_indices) node_source.push_back(source[index]);
             LodSettings node_settings = settings_;
             node_settings.levels = settings_.levels - level;
-            const std::vector<LodLevel> candidates = LodGenerator(node_settings).generate(std::move(node_source));
-            const size_t required_parent_count = child_splats > settings_.max_refinement_cost
-                ? child_splats - settings_.max_refinement_cost : 0;
-            size_t selected = 0;
-            while (selected + 1 < candidates.size() &&
-                   candidates[selected].splats.size() < required_parent_count) {
-                ++selected;
+            const std::vector<LodLevel> candidates = LodGenerator(node_settings).generate(node_source);
+            // Use a fixed coarseness factor for all siblings at this level, not per-node.
+            // This ensures siblings have comparable error values, preventing LOD flipping
+            // due to visibility changes. Target: keep parent roughly 2-4x coarser than children.
+            const size_t target_parent_splats = std::max<size_t>(1, child_splats / 3);
+            size_t selected = candidates.size() - 1;
+            while (selected > 0 &&
+                   candidates[selected].splats.size() > target_parent_splats) {
+                --selected;
             }
-            parent.representation = candidates[selected];
-            parent.representation.error = std::max(parent.representation.error, child_error);
-            parents.push_back(parent.id);
-            hierarchy.nodes_per_level[level].push_back(parent.id);
-            hierarchy.nodes.push_back(std::move(parent));
+            node.representation = candidates[selected];
+            if (node.representation.splats.size() >= child_splats ||
+                node.representation.error <= child_error) {
+                node.representation = decimate(node_source);
+            }
+            node.representation.error = std::max(node.representation.error, child_error);
         }
-        current = std::move(parents);
+        hierarchy.nodes_per_level[level].push_back(node.id);
+        hierarchy.nodes.push_back(std::move(node));
+        return hierarchy.nodes.back().id;
+    };
+    for (size_t root : partition_roots) hierarchy.roots.push_back(emit(root, 0));
+
+    std::vector<size_t> ownership(source.size(), 0);
+    for (size_t node_id : hierarchy.nodes_per_level[finest_level]) {
+        for (size_t index : hierarchy.nodes[node_id].source_indices) {
+            if (index >= ownership.size()) throw std::runtime_error("Spatial leaf has an invalid source index");
+            ++ownership[index];
+        }
     }
-    hierarchy.roots = current;
+    if (std::any_of(ownership.begin(), ownership.end(), [](size_t count) { return count != 1; })) {
+        throw std::runtime_error("Spatial partition did not assign every finest splat to exactly one leaf");
+    }
+
+    auto overlap_volume = [](const BBox& a, const BBox& b) {
+        double volume = 1.0;
+        for (int axis = 0; axis < 3; ++axis) {
+            const double extent = std::min<double>(a.max[axis], b.max[axis]) -
+                                  std::max<double>(a.min[axis], b.min[axis]);
+            if (!(extent > 0.0)) return 0.0;
+            volume *= extent;
+        }
+        return volume;
+    };
+    auto record_overlap = [&](SpatialOverlapStats& stats, const BBox& a, const BBox& b) {
+        ++stats.pair_count;
+        const double volume = overlap_volume(a, b);
+        if (volume > 0.0) {
+            ++stats.overlap_count;
+            stats.total_overlap_volume += volume;
+            stats.max_overlap_volume = std::max(stats.max_overlap_volume, volume);
+        }
+    };
+    for (const SpatialLodNode& node : hierarchy.nodes) {
+        for (size_t i = 0; i < node.children.size(); ++i) {
+            for (size_t j = i + 1; j < node.children.size(); ++j) {
+                record_overlap(hierarchy.sibling_overlap,
+                               hierarchy.nodes[node.children[i]].bounds,
+                               hierarchy.nodes[node.children[j]].bounds);
+            }
+        }
+    }
+    for (size_t i = 0; i < hierarchy.roots.size(); ++i) {
+        for (size_t j = i + 1; j < hierarchy.roots.size(); ++j) {
+            record_overlap(hierarchy.sibling_overlap,
+                           hierarchy.nodes[hierarchy.roots[i]].bounds,
+                           hierarchy.nodes[hierarchy.roots[j]].bounds);
+        }
+    }
+    const std::vector<size_t>& leaves = hierarchy.nodes_per_level[finest_level];
+    for (size_t i = 0; i < leaves.size(); ++i) {
+        for (size_t j = i + 1; j < leaves.size(); ++j) {
+            record_overlap(hierarchy.leaf_overlap,
+                           hierarchy.nodes[leaves[i]].bounds,
+                           hierarchy.nodes[leaves[j]].bounds);
+        }
+    }
+    if (hierarchy.sibling_overlap.overlap_count != 0 || hierarchy.leaf_overlap.overlap_count != 0) {
+        throw std::runtime_error("Spatial hierarchy contains positive-volume sibling or leaf overlap");
+    }
+
     for (const SpatialLodNode& node : hierarchy.nodes) {
         hierarchy.splats_per_level[node.level] += node.representation.splats.size();
         hierarchy.errors_per_level[node.level] = std::max(hierarchy.errors_per_level[node.level],
                                                            node.representation.error);
     }
-    for (size_t root : hierarchy.roots) hierarchy.bounds.expand(hierarchy.nodes[root].bounds);
+    hierarchy.bounds = root_bounds;
     return hierarchy;
 }
 

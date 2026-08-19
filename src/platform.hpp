@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cerrno>
+#include <cstdlib>
 
 #include <vector>
 #include <string>
@@ -160,14 +161,74 @@ inline FILE* fopen(const fs::path& path, const char* mode) {
 #endif
 }
 
+inline fs::path resolve_executable(const fs::path& executable) {
+    if (executable.empty()) return {};
+
+    auto candidate_exists = [](const fs::path& candidate) {
+        if (candidate.empty()) return false;
+        if (fs::exists(candidate)) return true;
+#ifdef _WIN32
+        if (!candidate.extension().empty()) return false;
+        for (const auto& suffix : { ".exe", ".cmd", ".bat" }) {
+            if (fs::exists(candidate.string() + suffix)) return true;
+        }
+#endif
+        return false;
+    };
+
+    if (candidate_exists(executable)) {
+        return executable;
+    }
+
+    const fs::path name = executable.filename();
+    if (name.empty()) return executable;
+
+    std::vector<fs::path> search_roots;
+    search_roots.push_back(fs::current_path());
+    fs::path dir = fs::current_path();
+    while (!dir.empty()) {
+        search_roots.push_back(dir);
+        const fs::path parent = dir.parent_path();
+        if (parent == dir) break;
+        dir = parent;
+    }
+
+    for (const auto& root : search_roots) {
+        const fs::path local = root / "node_modules" / ".bin" / name;
+        if (candidate_exists(local)) return local;
+        const fs::path direct = root / name;
+        if (candidate_exists(direct)) return direct;
+    }
+
+    const char* path_env = std::getenv("PATH");
+    if (path_env) {
+        std::string paths = path_env;
+        size_t start = 0;
+        while (start <= paths.size()) {
+            const size_t end = paths.find(':', start);
+            const std::string item = paths.substr(start, end == std::string::npos ? std::string::npos : end - start);
+            if (!item.empty()) {
+                const fs::path from_path = fs::path(item) / name;
+                if (candidate_exists(from_path)) return from_path;
+            }
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+    }
+
+    return executable;
+}
+
 /// Run a process without involving a shell. The first item is the executable.
 /// Returns its exit code, or 127 when it could not be launched.
 inline int run_process(const std::vector<fs::path>& arguments) {
     if (arguments.empty()) return 127;
+    std::vector<fs::path> resolved = arguments;
+    resolved[0] = resolve_executable(resolved[0]);
 #ifdef _WIN32
     std::vector<std::wstring> storage;
-    storage.reserve(arguments.size());
-    for (const auto& argument : arguments) storage.push_back(argument.wstring());
+    storage.reserve(resolved.size());
+    for (const auto& argument : resolved) storage.push_back(argument.wstring());
     std::vector<const wchar_t*> argv;
     argv.reserve(storage.size() + 1);
     for (const auto& argument : storage) argv.push_back(argument.c_str());
@@ -179,8 +240,8 @@ inline int run_process(const std::vector<fs::path>& arguments) {
     if (pid < 0) return 127;
     if (pid == 0) {
         std::vector<std::string> storage;
-        storage.reserve(arguments.size());
-        for (const auto& argument : arguments) storage.push_back(argument.string());
+        storage.reserve(resolved.size());
+        for (const auto& argument : resolved) storage.push_back(argument.string());
         std::vector<char*> argv;
         argv.reserve(storage.size() + 1);
         for (auto& argument : storage) argv.push_back(argument.data());
