@@ -15,6 +15,10 @@
 #include <stdexcept>
 #include <chrono>
 #include <cctype>
+#include <cmath>
+#include <fstream>
+#include <functional>
+#include <numeric>
 
 namespace fs = std::filesystem;
 
@@ -89,6 +93,9 @@ void ConvertApp::run() {
     if (lod_settings_.generate) {
         generateLods();
         reportProgress(4, "Generated " + std::to_string(lod_files_.size()) + " LOD levels");
+    } else if (output_format_ == OutputFormat::Lcc2 && lod_files_.size() > 1) {
+        organizeSuppliedLods();
+        reportProgress(4, "Organized supplied LODs into a spatial hierarchy");
     }
 
     // Step 1: Build spatial grid
@@ -202,7 +209,7 @@ void ConvertApp::printUsage() {
               << "  --max-refinement-cost N Maximum child-minus-parent splat jump (default: 20000)\n"
               << "  --max-node-diagonal D Split spatial leaves above this source-space diagonal (0 disables)\n"
               << "  --min-split-splats N Minimum splats for extent-driven splitting (default: 1024)\n"
-              << "  --lcc2-payload-layout L level (default) or chunked\n"
+              << "  --lcc2-payload-layout L generated LOD layout: level (default) or chunked\n"
               << "  --max-payload-splats N Maximum splats per chunked payload (default: 262144)\n"
               << "  --cell-size X,Y    Grid cell size in meters (default: 30,30)\n";
 }
@@ -363,16 +370,53 @@ void ConvertApp::parseArgs() {
     if (!std::isfinite(lod_settings_.max_node_diagonal) || lod_settings_.max_node_diagonal < 0.0f) {
         throw std::runtime_error("--max-node-diagonal must be finite and non-negative");
     }
-    if (lod_settings_.payload_layout == Lcc2PayloadLayout::Chunked && !lod_settings_.generate) {
-        throw std::runtime_error("--lcc2-payload-layout chunked currently requires --generate-lod");
-    }
-
     log("Input: " + input_path_.u8string() + "\n");
 }
 
 void ConvertApp::findPlyFiles() {
+    // A trailing decimal level is authoritative when present. This accepts
+    // scene_lod0.ply, scene_0.ply, and scene0.ply and lets any member of the
+    // set be used as the CLI input.
+    const std::string input_stem = input_path_.stem().u8string();
+    size_t digit_begin = input_stem.size();
+    while (digit_begin > 0 && std::isdigit(static_cast<unsigned char>(input_stem[digit_begin - 1]))) {
+        --digit_begin;
+    }
+    if (digit_begin < input_stem.size()) {
+        const std::string prefix = input_stem.substr(0, digit_begin);
+        std::map<size_t, fs::path> levels;
+        for (const auto& entry : fs::directory_iterator(input_dir_)) {
+            if (!entry.is_regular_file() && !entry.is_symlink()) continue;
+            std::string extension = entry.path().extension().u8string();
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (extension != ".ply") continue;
+            const std::string stem = entry.path().stem().u8string();
+            if (stem.size() <= prefix.size() || stem.compare(0, prefix.size(), prefix) != 0) continue;
+            const std::string suffix = stem.substr(prefix.size());
+            if (!std::all_of(suffix.begin(), suffix.end(),
+                             [](unsigned char c) { return std::isdigit(c); })) continue;
+            const size_t level = static_cast<size_t>(std::stoull(suffix));
+            if (!levels.emplace(level, entry.path()).second) {
+                throw std::runtime_error("Duplicate supplied LOD level " + std::to_string(level));
+            }
+        }
+        if (levels.size() > 1) {
+            size_t expected = 0;
+            for (const auto& [level, path] : levels) {
+                if (level != expected) {
+                    throw std::runtime_error("Supplied LOD filenames must form a contiguous 0..N sequence; missing level " +
+                                             std::to_string(expected));
+                }
+                lod_files_.push_back(path);
+                ++expected;
+            }
+            has_supplied_lod_suffixes_ = true;
+        }
+    }
+
     // LOD0 is the base file
-    lod_files_.push_back(input_path_);
+    if (lod_files_.empty()) lod_files_.push_back(input_path_);
 
     // Find numbered LOD files: base_1.ply, base_2.ply, ...
     if (lod_settings_.generate) {
@@ -382,6 +426,7 @@ void ConvertApp::findPlyFiles() {
     std::vector<std::pair<int, fs::path>> numbered_files;
 
     for (const auto& entry : fs::directory_iterator(input_dir_)) {
+        if (has_supplied_lod_suffixes_) break;
         if (lod_settings_.generate) break;
         std::string filename = entry.path().filename().u8string();
         std::smatch match;
@@ -469,6 +514,273 @@ void ConvertApp::findPlyFiles() {
             poses_file_.clear();
         }
     }
+}
+
+void ConvertApp::organizeSuppliedLods() {
+    const auto started = std::chrono::steady_clock::now();
+    if (lod_files_.size() < 2) return;
+    if (!lcc2_payload_files_.empty()) {
+        log("Warning: supplied whole-level payloads are being re-encoded into spatial SPZ chunks\n");
+        lcc2_payload_files_.clear();
+    }
+
+    struct SourceInfo {
+        fs::path path;
+        size_t count = 0;
+        int num_f_rest = 0;
+        int sh_degree = 0;
+    };
+    std::vector<SourceInfo> sources;
+    for (const fs::path& path : lod_files_) {
+        SplatBuffer buffer;
+        if (!buffer.initialize(path)) {
+            throw std::runtime_error("Failed to read supplied LOD " + path.u8string() + ": " + buffer.error());
+        }
+        sources.push_back({path, buffer.size(), buffer.num_f_rest(), buffer.sh_degree()});
+    }
+    const int num_f_rest = sources.front().num_f_rest;
+    const int sh_degree = sources.front().sh_degree;
+    if (num_f_rest > 45) {
+        throw std::runtime_error("Supplied spatial LOD currently supports at most SH degree 3; refusing to drop coefficients");
+    }
+    for (const SourceInfo& source : sources) {
+        if (source.num_f_rest != num_f_rest || source.sh_degree != sh_degree) {
+            throw std::runtime_error("All supplied LODs must use the same SH degree and coefficient layout");
+        }
+    }
+    std::stable_sort(sources.begin(), sources.end(), [](const SourceInfo& a, const SourceInfo& b) {
+        return a.count < b.count;
+    });
+    for (size_t i = 1; i < sources.size(); ++i) {
+        if (sources[i - 1].count == sources[i].count) {
+            throw std::runtime_error("Cannot infer supplied LOD detail order because two levels have the same splat count");
+        }
+    }
+    const size_t level_count = sources.size();
+    const size_t finest_level = level_count - 1;
+
+    log("\nSupplied spatial LOD organization:\n");
+    log("  inferred levels: " + std::to_string(level_count) + " (ordered by splat count)\n");
+    for (size_t level = 0; level < level_count; ++level) {
+        log("  LOD" + std::to_string(level) + " coarse-to-fine: " +
+            sources[level].path.filename().u8string() + " (" + std::to_string(sources[level].count) + " splats)\n");
+    }
+
+    SplatBuffer finest_buffer;
+    if (!finest_buffer.initialize(sources[finest_level].path)) {
+        throw std::runtime_error("Failed to read finest supplied LOD: " + finest_buffer.error());
+    }
+    std::vector<Splat> finest = finest_buffer.to_vector();
+    LodGenerator::validate(finest, "finest supplied LOD");
+
+    struct PartitionNode {
+        int axis = -1;
+        float split = 0.0f;
+        size_t low = std::numeric_limits<size_t>::max();
+        size_t high = std::numeric_limits<size_t>::max();
+        size_t leaf = std::numeric_limits<size_t>::max();
+    };
+    std::vector<PartitionNode> partition;
+    std::vector<size_t> finest_leaf(finest.size(), 0);
+    size_t leaf_count = 0;
+    std::function<size_t(std::vector<size_t>)> split = [&](std::vector<size_t> indices) -> size_t {
+        const size_t node_id = partition.size();
+        partition.emplace_back();
+        BBox centers;
+        for (size_t index : indices) centers.expand(finest[index].pos);
+        const double extents[3] = {
+            static_cast<double>(centers.max.x) - centers.min.x,
+            static_cast<double>(centers.max.y) - centers.min.y,
+            static_cast<double>(centers.max.z) - centers.min.z
+        };
+        const double diagonal = std::sqrt(extents[0] * extents[0] + extents[1] * extents[1] +
+                                          extents[2] * extents[2]);
+        const bool over_count = indices.size() > lod_settings_.max_leaf_splats;
+        const bool over_extent = lod_settings_.max_node_diagonal > 0.0f &&
+            diagonal > lod_settings_.max_node_diagonal &&
+            indices.size() >= 2 * lod_settings_.min_split_splats;
+        if (!over_count && !over_extent) {
+            partition[node_id].leaf = leaf_count;
+            for (size_t index : indices) finest_leaf[index] = leaf_count;
+            ++leaf_count;
+            return node_id;
+        }
+        int axis = 0;
+        if (extents[1] > extents[axis]) axis = 1;
+        if (extents[2] > extents[axis]) axis = 2;
+        std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            const float av = finest[a].pos[axis], bv = finest[b].pos[axis];
+            return av < bv || (av == bv && a < b);
+        });
+        const size_t middle = indices.size() / 2;
+        if (middle == 0 || middle == indices.size()) {
+            throw std::runtime_error("Supplied LOD spatial partition failed to make progress");
+        }
+        std::vector<size_t> low(indices.begin(), indices.begin() + static_cast<ptrdiff_t>(middle));
+        std::vector<size_t> high(indices.begin() + static_cast<ptrdiff_t>(middle), indices.end());
+        const float low_max = finest[low.back()].pos[axis];
+        const float high_min = finest[high.front()].pos[axis];
+        partition[node_id].axis = axis;
+        partition[node_id].split = low_max + (high_min - low_max) * 0.5f;
+        partition[node_id].low = split(std::move(low));
+        partition[node_id].high = split(std::move(high));
+        return node_id;
+    };
+    std::vector<size_t> all(finest.size());
+    std::iota(all.begin(), all.end(), size_t{0});
+    const size_t partition_root = split(std::move(all));
+    log("  frozen spatial leaves: " + std::to_string(leaf_count) +
+        " (maximum finest splats " + std::to_string(lod_settings_.max_leaf_splats) + ")\n");
+
+    auto assign_leaf = [&](const Vec3f& position) {
+        size_t node_id = partition_root;
+        while (partition[node_id].leaf == std::numeric_limits<size_t>::max()) {
+            const PartitionNode& node = partition[node_id];
+            node_id = position[node.axis] <= node.split ? node.low : node.high;
+        }
+        return partition[node_id].leaf;
+    };
+    auto expand_support = [](BBox& bounds, const Splat& splat) {
+        constexpr float support_sigma = 3.0f;
+        const float radius = support_sigma * std::max({std::exp(splat.scale.x),
+                                                       std::exp(splat.scale.y),
+                                                       std::exp(splat.scale.z)});
+        bounds.expand(Vec3f(splat.pos.x - radius, splat.pos.y - radius, splat.pos.z - radius));
+        bounds.expand(Vec3f(splat.pos.x + radius, splat.pos.y + radius, splat.pos.z + radius));
+    };
+
+    generated_lod_dir_ = output_dir_ / ".supplied_spatial_lod";
+    fs::create_directories(generated_lod_dir_);
+    hierarchy_ = {};
+    hierarchy_.level_count = level_count;
+    hierarchy_.splats_per_level.assign(level_count, 0);
+    hierarchy_.errors_per_level.resize(level_count);
+    hierarchy_.allow_spatial_bound_overlap = true;
+    has_generated_hierarchy_ = true;
+    std::vector<std::vector<size_t>> node_for(
+        level_count, std::vector<size_t>(leaf_count, std::numeric_limits<size_t>::max()));
+    std::vector<fs::path> reordered_lods;
+
+    for (size_t level = 0; level < level_count; ++level) {
+        std::vector<Splat> source;
+        if (level == finest_level) {
+            source = std::move(finest);
+        } else {
+            SplatBuffer buffer;
+            if (!buffer.initialize(sources[level].path)) {
+                throw std::runtime_error("Failed to read supplied LOD " + sources[level].path.u8string());
+            }
+            source = buffer.to_vector();
+        }
+        LodGenerator::validate(source, "supplied LOD" + std::to_string(level));
+        std::vector<size_t> assignments(source.size());
+        std::vector<size_t> counts(leaf_count, 0);
+        for (size_t i = 0; i < source.size(); ++i) {
+            const size_t leaf = level == finest_level ? finest_leaf[i] : assign_leaf(source[i].pos);
+            assignments[i] = leaf;
+            ++counts[leaf];
+        }
+        std::vector<size_t> offsets(leaf_count + 1, 0);
+        for (size_t leaf = 0; leaf < leaf_count; ++leaf) offsets[leaf + 1] = offsets[leaf] + counts[leaf];
+        std::vector<size_t> cursors(offsets.begin(), offsets.end() - 1);
+        std::vector<Splat> reordered(source.size());
+        std::vector<BBox> own_bounds(leaf_count);
+        for (size_t i = 0; i < source.size(); ++i) {
+            const size_t leaf = assignments[i];
+            expand_support(own_bounds[leaf], source[i]);
+            reordered[cursors[leaf]++] = std::move(source[i]);
+        }
+        hierarchy_.splats_per_level[level] = reordered.size();
+        hierarchy_.errors_per_level[level] = static_cast<float>(finest_level - level);
+
+        const fs::path complete_path = generated_lod_dir_ /
+            ("supplied_lod_" + std::to_string(level) + ".ply");
+        LodGenerator::write_binary_ply(complete_path, reordered, num_f_rest);
+        reordered_lods.push_back(complete_path);
+
+        for (size_t leaf = 0; leaf < leaf_count; ++leaf) {
+            if (counts[leaf] == 0) continue;
+            Lcc2HierarchyNodeInfo node;
+            node.id = hierarchy_.nodes.size();
+            node.level = level;
+            node.count = counts[leaf];
+            node.error = hierarchy_.errors_per_level[level];
+            node.bounds = own_bounds[leaf];
+            node_for[level][leaf] = node.id;
+            hierarchy_.nodes.push_back(node);
+        }
+
+        size_t chunk = 0;
+        size_t leaf = 0;
+        while (leaf < leaf_count) {
+            while (leaf < leaf_count && counts[leaf] == 0) ++leaf;
+            if (leaf == leaf_count) break;
+            std::vector<size_t> group;
+            size_t group_count = 0;
+            while (leaf < leaf_count) {
+                if (counts[leaf] == 0) { ++leaf; continue; }
+                if (counts[leaf] > lod_settings_.max_payload_splats) {
+                    throw std::runtime_error("--max-payload-splats is smaller than supplied LOD" +
+                                             std::to_string(level) + " spatial leaf " + std::to_string(leaf));
+                }
+                if (!group.empty() && group_count + counts[leaf] > lod_settings_.max_payload_splats) break;
+                group.push_back(leaf);
+                group_count += counts[leaf];
+                ++leaf;
+            }
+            std::vector<Splat> payload_splats;
+            payload_splats.reserve(group_count);
+            const size_t payload_index = hierarchy_.payloads.size();
+            for (size_t group_leaf : group) {
+                Lcc2HierarchyNodeInfo& node = hierarchy_.nodes[node_for[level][group_leaf]];
+                node.payload_index = payload_index;
+                node.start = payload_splats.size();
+                payload_splats.insert(payload_splats.end(),
+                    reordered.begin() + static_cast<ptrdiff_t>(offsets[group_leaf]),
+                    reordered.begin() + static_cast<ptrdiff_t>(offsets[group_leaf + 1]));
+            }
+            const std::string stem = "supplied_lod_" + std::to_string(level) +
+                                     "_chunk_" + std::to_string(chunk++);
+            const fs::path ply_path = generated_lod_dir_ / (stem + ".ply");
+            const fs::path spz_path = generated_lod_dir_ / (stem + ".spz");
+            LodGenerator::write_binary_ply(ply_path, payload_splats, num_f_rest);
+            const std::vector<fs::path> command{
+                splat_transform_path_, "--quiet", "--overwrite", "--spz-version", "4", ply_path, spz_path
+            };
+            const int exit_code = platform::run_process(command);
+            if (exit_code != 0) {
+                throw std::runtime_error("splat-transform failed while encoding supplied spatial chunk " + stem +
+                                         " (exit code " + std::to_string(exit_code) + ")");
+            }
+            Lcc2Writer::validate_spz_v4(spz_path, payload_splats.size(), sh_degree);
+            hierarchy_.payloads.push_back({ply_path, spz_path, level, payload_splats.size()});
+        }
+        log("  LOD" + std::to_string(level) + ": " + std::to_string(reordered.size()) +
+            " splats, " + std::to_string(chunk) + " SPZ chunks\n");
+    }
+
+    for (size_t leaf = 0; leaf < leaf_count; ++leaf) {
+        std::vector<size_t> chain;
+        for (size_t level = 0; level < level_count; ++level) {
+            if (node_for[level][leaf] != std::numeric_limits<size_t>::max()) {
+                chain.push_back(node_for[level][leaf]);
+            }
+        }
+        if (chain.empty()) continue;
+        hierarchy_.roots.push_back(chain.front());
+        for (size_t i = 0; i + 1 < chain.size(); ++i) {
+            hierarchy_.nodes[chain[i]].children = {chain[i + 1]};
+        }
+        for (size_t i = chain.size(); i-- > 1;) {
+            hierarchy_.nodes[chain[i - 1]].bounds.expand(hierarchy_.nodes[chain[i]].bounds);
+        }
+        hierarchy_.bounds.expand(hierarchy_.nodes[chain.front()].bounds);
+    }
+    lod_files_ = std::move(reordered_lods);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    log("  hierarchy roots/nodes/payloads: " + std::to_string(hierarchy_.roots.size()) + "/" +
+        std::to_string(hierarchy_.nodes.size()) + "/" + std::to_string(hierarchy_.payloads.size()) + "\n");
+    log("  supplied LOD organization time: " + std::to_string(seconds) + " seconds\n");
 }
 
 void ConvertApp::generateLods() {

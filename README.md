@@ -6,7 +6,7 @@ A high-performance converter for 3D Gaussian Splatting (3DGS) PLY files to LCC a
 
 - **Zero-copy PLY reading**: Memory-mapped file access with SplatView for direct data access
 - **Parallel grid building**: OpenMP-parallelized spatial partitioning with thread-local grids
-- **Multi-LOD support**: Automatic detection and processing of LOD files (point_cloud_1.ply, point_cloud_2.ply, etc.)
+- **Multi-LOD support**: Automatic detection of legacy `point_cloud_1.ply` files and trailing level sets such as `garden_lod0.ply` through `garden_lodN.ply`
 - **Environment support**: Separate processing of environment splats (environment.ply)
 - **SH coefficient encoding**: Full support for spherical harmonic coefficients (degree 3)
 - **SuperSplat-compatible LCC2 LODs**: Offline hierarchies packaged as validated SPZ v4 payloads
@@ -129,6 +129,30 @@ The conversion fails rather than writing a partial package if an SPZ encoder
 exits unsuccessfully, omits an output, writes a version other than SPZ v4, or
 produces a mismatched splat count or SH degree.
 
+### Preserving supplied trained LODs
+
+When LCC2 input resolves to two or more trailing-numbered PLY files, the
+converter automatically uses the supplied spatial LOD workflow. Any member of
+the set can be passed as `-i`; the converter infers the contiguous `0..N` set:
+
+```bash
+./ply2lcc2 -i garden_lod2.ply -o garden_lcc2 --format lcc2
+```
+
+Levels are ordered coarsest-to-finest by their splat counts, so both
+`lod0 = finest` and `lod0 = coarsest` export conventions are accepted. The
+finest supplied level builds one frozen adaptive spatial partition. Every
+Gaussian in every supplied level is then assigned by centre to that partition,
+reordered without changing its attributes, and encoded into bounded SPZ v4
+chunks. This path never clusters, decimates, merges, or retrains the supplied
+Gaussians.
+
+`--max-leaf-splats` controls finest spatial partition density and
+`--max-payload-splats` controls chunk size. Complete node representations are
+never split. Conservative node bounds use three times the largest Gaussian
+principal scale and may overlap neighboring render bounds even though centre
+ownership is unique.
+
 LCC2 output currently includes 3DGS LOD files. An environment PLY is supported
 only when the LCC2 splat payloads are also PLY; it cannot be mixed with SPZ
 payloads. Collision meshes and trajectory poses remain available only in the
@@ -179,7 +203,7 @@ This builds both the CLI (`ply2lcc2`) and GUI (`ply2lcc-gui`) executables.
 | `--max-refinement-cost <n>` | Maximum child-count minus parent-count refinement jump | 20000 |
 | `--max-node-diagonal <d>` | Extent-driven leaf split threshold in source units; 0 disables | 0 |
 | `--min-split-splats <n>` | Minimum membership for extent-driven splitting | 1024 |
-| `--lcc2-payload-layout level\|chunked` | One payload per rank or bounded multi-file ranks | `level` |
+| `--lcc2-payload-layout level\|chunked` | Generated-LOD payload layout; supplied multi-LOD input is always spatially chunked | `level` |
 | `--max-payload-splats <n>` | Maximum splats per chunked payload; nodes are never split | 262144 |
 
 See [Adaptive LCC2 hierarchy design](docs/adaptive-lcc2-hierarchy.md) for the

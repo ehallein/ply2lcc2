@@ -225,7 +225,8 @@ void Lcc2Writer::write(const SpatialGrid& grid,
                 if (hierarchy->roots[j] >= hierarchy->nodes.size()) {
                     throw std::runtime_error("Generated hierarchy has an invalid root reference");
                 }
-                if (bounds_overlap_in_volume(hierarchy->nodes[hierarchy->roots[i]].bounds,
+                if (!hierarchy->allow_spatial_bound_overlap &&
+                    bounds_overlap_in_volume(hierarchy->nodes[hierarchy->roots[i]].bounds,
                                              hierarchy->nodes[hierarchy->roots[j]].bounds)) {
                     throw std::runtime_error("Generated hierarchy root bounds overlap in volume");
                 }
@@ -244,14 +245,14 @@ void Lcc2Writer::write(const SpatialGrid& grid,
                     }
                     const BBox& a = hierarchy->nodes[node.children[i]].bounds;
                     const BBox& b = hierarchy->nodes[node.children[j]].bounds;
-                    if (bounds_overlap_in_volume(a, b)) {
+                    if (!hierarchy->allow_spatial_bound_overlap && bounds_overlap_in_volume(a, b)) {
                         throw std::runtime_error("Generated hierarchy sibling bounds overlap in volume");
                     }
                 }
             }
             for (size_t child_id : node.children) {
                 if (child_id >= hierarchy->nodes.size() ||
-                    hierarchy->nodes[child_id].level != node.level + 1) {
+                    hierarchy->nodes[child_id].level <= node.level) {
                     throw std::runtime_error("Generated hierarchy has an invalid parent/child level transition");
                 }
                 const Lcc2HierarchyNodeInfo& child = hierarchy->nodes[child_id];

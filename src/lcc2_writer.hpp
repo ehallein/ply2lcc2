@@ -34,6 +34,10 @@ struct Lcc2HierarchyInfo {
     std::vector<Lcc2HierarchyNodeInfo> nodes;
     std::vector<size_t> roots;
     BBox bounds;
+    // Supplied LODs use conservative Gaussian support bounds. Adjacent
+    // spatial regions may therefore overlap even though centre ownership does
+    // not. Generated hierarchies continue to require disjoint cell bounds.
+    bool allow_spatial_bound_overlap = false;
 };
 
 class Lcc2Writer {

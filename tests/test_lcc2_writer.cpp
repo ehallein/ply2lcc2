@@ -290,6 +290,38 @@ TEST(Lcc2WriterTest, ChunkedPayloadsAreBoundedAndReferenced) {
     EXPECT_NE(metadata.find("\"name\": 5, \"start\": 0, \"count\": 6"), std::string::npos);
 }
 
+TEST(Lcc2WriterTest, SuppliedTrailingLodsAreInferredPreservedAndSpatiallyChunked) {
+    const fs::path base = fs::temp_directory_path() / "ply2lcc_lcc2_supplied_spatial_test";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    // Brush-style numbering is finest-to-coarsest here. Start conversion from
+    // the middle file to prove that the complete 0..N set is inferred.
+    write_many_splats(base / "garden_lod0.ply", 24);
+    write_many_splats(base / "garden_lod1.ply", 12);
+    write_many_splats(base / "garden_lod2.ply", 6);
+
+    ConvertConfig config;
+    config.input_path = base / "garden_lod1.ply";
+    config.output_dir = base / "output";
+    config.output_format = OutputFormat::Lcc2;
+    config.include_env = false;
+    config.lod.max_leaf_splats = 6;
+    config.lod.max_payload_splats = 7;
+    config.splat_transform_path = PLY2LCC_FAKE_SPLAT_TRANSFORM;
+    ConvertApp(config).run();
+
+    const std::string metadata = read_text(base / "output/meta.lcc2");
+    EXPECT_NE(metadata.find("\"lodSplats\": [24, 12, 6]"), std::string::npos);
+    EXPECT_NE(metadata.find("\"totalSplats\": 42"), std::string::npos);
+    EXPECT_NE(metadata.find("\"totalLevels\": 3"), std::string::npos);
+    EXPECT_NE(metadata.find("\"splatType\": \".spz\""), std::string::npos);
+    EXPECT_NE(metadata.find("supplied_lod_2_chunk_3.spz"), std::string::npos);
+    EXPECT_NE(metadata.find("\"lodLevel\": 2"), std::string::npos);
+    EXPECT_NE(metadata.find("\"lodLevel\": 0"), std::string::npos);
+    EXPECT_FALSE(fs::exists(base / "output/.supplied_spatial_lod"));
+    fs::remove_all(base);
+}
+
 TEST(Lcc2WriterTest, ChunkedLayoutRejectsPayloadSmallerThanANode) {
     const fs::path base = fs::temp_directory_path() / "ply2lcc_lcc2_chunk_too_small_test";
     fs::remove_all(base);

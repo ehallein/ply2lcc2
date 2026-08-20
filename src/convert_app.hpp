@@ -24,6 +24,7 @@ private:
     void parseArgs();
     void findPlyFiles();
     void generateLods();
+    void organizeSuppliedLods();
     void printUsage();
 
     int argc_;
@@ -49,6 +50,7 @@ private:
     std::vector<LodLevelStats> lod_stats_;
     Lcc2HierarchyInfo hierarchy_;
     bool has_generated_hierarchy_ = false;
+    bool has_supplied_lod_suffixes_ = false;
 
     // Discovered files
     std::vector<std::filesystem::path> lod_files_;
