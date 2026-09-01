@@ -38,6 +38,9 @@ struct Lcc2HierarchyInfo {
     // spatial regions may therefore overlap even though centre ownership does
     // not. Generated hierarchies continue to require disjoint cell bounds.
     bool allow_spatial_bound_overlap = false;
+    // Supplied LOD compatibility requires one unary node at every rank for
+    // every root so runtimes never substitute a finer mandatory fallback.
+    bool require_complete_unary_rank_chains = false;
 };
 
 class Lcc2Writer {

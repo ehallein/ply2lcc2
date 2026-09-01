@@ -352,3 +352,77 @@ TEST(LodGeneratorTest, SpatialDiagonalLimitTriggersAdditionalFineSplits) {
         EXPECT_EQ(hierarchy.nodes[leaf].source_indices.size(), 1u);
     }
 }
+
+// cluster_to_count fills gaps in a supplied LOD ladder, so it must hit its
+// target exactly - the caller has already reserved that many slots.
+TEST(LodGeneratorTest, ClusterToCountEmitsExactlyTheRequestedCount) {
+    std::vector<Splat> source;
+    for (int i = 0; i < 64; ++i)
+        source.push_back(make_splat(i * 0.05f, 0, 0, 1, 1, 1));
+    for (size_t target : {size_t{1}, size_t{7}, size_t{32}, size_t{64}}) {
+        const LodLevel level = LodGenerator::cluster_to_count(source, target);
+        EXPECT_EQ(level.splats.size(), target);
+        EXPECT_EQ(level.stats.output_count, target);
+    }
+}
+
+TEST(LodGeneratorTest, ClusterToCountRejectsOutOfRangeTargets) {
+    const std::vector<Splat> source{make_splat(0, 0, 0, 1, 1, 1)};
+    EXPECT_THROW(LodGenerator::cluster_to_count(source, 0), std::runtime_error);
+    EXPECT_THROW(LodGenerator::cluster_to_count(source, 2), std::runtime_error);
+    EXPECT_THROW(LodGenerator::cluster_to_count({}, 1), std::runtime_error);
+}
+
+// Overlapping Gaussians are what merging is for: the representative should
+// genuinely combine them rather than fall back to picking one.
+TEST(LodGeneratorTest, ClusterToCountMergesOverlappingGaussians) {
+    std::vector<Splat> source;
+    for (int i = 0; i < 8; ++i)
+        source.push_back(make_splat(i * 0.02f, 0, 0, 1, 1, 1, 0.5f, 0.1f));
+    const LodLevel level = LodGenerator::cluster_to_count(source, 4);
+    ASSERT_EQ(level.splats.size(), 4u);
+    EXPECT_EQ(level.stats.rejected_merges, 0u);
+}
+
+// The regression this guards: merging Gaussians separated by far more than
+// their own size folds the gap into the merged covariance, producing a
+// representative as wide as the separation. Across a rank ladder that
+// compounds into Gaussians hundreds of metres across, which cost enough
+// fragments to hang the GPU. Sparse buckets must thin out instead.
+TEST(LodGeneratorTest, ClusterToCountDoesNotInflateScaleAcrossSparseGaps) {
+    constexpr float kScale = 0.1f;
+    std::vector<Splat> source;
+    for (int i = 0; i < 16; ++i)
+        source.push_back(make_splat(i * 50.0f, 0, 0, 1, 1, 1, 0.5f, kScale));
+
+    const LodLevel level = LodGenerator::cluster_to_count(source, 8);
+    ASSERT_EQ(level.splats.size(), 8u);
+    EXPECT_EQ(level.stats.rejected_merges, 8u);
+    for (const Splat& splat : level.splats) {
+        const float widest = std::max({std::exp(splat.scale.x),
+                                       std::exp(splat.scale.y),
+                                       std::exp(splat.scale.z)});
+        EXPECT_LE(widest, kScale * 4.0f) << "sparse merge inflated a representative";
+    }
+}
+
+// Repeated coarsening is where the old behaviour compounded worst, so assert
+// the bound holds down a whole ladder rather than for a single step.
+TEST(LodGeneratorTest, ClusterToCountScaleStaysBoundedDownALadder) {
+    constexpr float kScale = 0.05f;
+    std::vector<Splat> level_splats;
+    for (int i = 0; i < 128; ++i)
+        level_splats.push_back(make_splat(i * 12.0f, 0, 0, 1, 1, 1, 0.5f, kScale));
+
+    for (size_t target = 64; target >= 1; target /= 2) {
+        const LodLevel level = LodGenerator::cluster_to_count(level_splats, target);
+        ASSERT_EQ(level.splats.size(), target);
+        level_splats = level.splats;
+    }
+    for (const Splat& splat : level_splats) {
+        const float widest = std::max({std::exp(splat.scale.x),
+                                       std::exp(splat.scale.y),
+                                       std::exp(splat.scale.z)});
+        EXPECT_LE(widest, kScale * 4.0f) << "ladder compounded representative scale";
+    }
+}

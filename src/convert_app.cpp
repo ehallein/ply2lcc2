@@ -656,12 +656,68 @@ void ConvertApp::organizeSuppliedLods() {
     hierarchy_.splats_per_level.assign(level_count, 0);
     hierarchy_.errors_per_level.resize(level_count);
     hierarchy_.allow_spatial_bound_overlap = true;
+    hierarchy_.require_complete_unary_rank_chains = true;
     has_generated_hierarchy_ = true;
     std::vector<std::vector<size_t>> node_for(
         level_count, std::vector<size_t>(leaf_count, std::numeric_limits<size_t>::max()));
-    std::vector<fs::path> reordered_lods;
+    std::vector<fs::path> reordered_lods(level_count);
 
+    // First record the supplied spatial coverage. Counts are intentionally a
+    // separate pass: synthesis targets depend on the next finer emitted rank,
+    // including a representation synthesized at that rank.
+    std::vector<std::vector<size_t>> supplied_counts(level_count,
+                                                      std::vector<size_t>(leaf_count, 0));
+    for (size_t i = 0; i < finest.size(); ++i) {
+        ++supplied_counts[finest_level][finest_leaf[i]];
+    }
+    for (size_t level = 0; level < finest_level; ++level) {
+        SplatBuffer buffer;
+        if (!buffer.initialize(sources[level].path)) {
+            throw std::runtime_error("Failed to inspect supplied LOD " + sources[level].path.u8string());
+        }
+        for (size_t i = 0; i < buffer.size(); ++i) ++supplied_counts[level][assign_leaf(buffer.pos(i))];
+    }
+
+    std::vector<size_t> original_first_rank(level_count, 0);
+    for (size_t leaf = 0; leaf < leaf_count; ++leaf) {
+        size_t first = 0;
+        while (first < level_count && supplied_counts[first][leaf] == 0) ++first;
+        if (first == level_count) {
+            throw std::runtime_error("Spatial leaf " + std::to_string(leaf) +
+                                     " has no supplied representation at any rank");
+        }
+        ++original_first_rank[first];
+    }
+    log("  supplied roots per coarsest-available rank:");
     for (size_t level = 0; level < level_count; ++level) {
+        log(" rank " + std::to_string(level) + "=" + std::to_string(original_first_rank[level]));
+    }
+    log("\n");
+
+    std::vector<std::vector<size_t>> emitted_counts = supplied_counts;
+    std::vector<size_t> synthesized_regions(level_count, 0);
+    std::vector<size_t> synthesized_splats(level_count, 0);
+    for (size_t level = finest_level; level-- > 0;) {
+        const size_t numerator = sources[level].count;
+        const size_t denominator = sources[level + 1].count;
+        for (size_t leaf = 0; leaf < leaf_count; ++leaf) {
+            if (emitted_counts[level][leaf] != 0) continue;
+            const size_t finer_count = emitted_counts[level + 1][leaf];
+            if (finer_count == 0) {
+                throw std::runtime_error("Cannot synthesize rank " + std::to_string(level) +
+                    " for spatial leaf " + std::to_string(leaf) +
+                    ": the next finer local representation is empty");
+            }
+            size_t target = std::max<size_t>(1, (finer_count * numerator + denominator / 2) / denominator);
+            emitted_counts[level][leaf] = target;
+            ++synthesized_regions[level];
+            synthesized_splats[level] += target;
+        }
+    }
+
+    std::vector<Splat> finer_reordered;
+    std::vector<size_t> finer_offsets;
+    for (size_t level = level_count; level-- > 0;) {
         std::vector<Splat> source;
         if (level == finest_level) {
             source = std::move(finest);
@@ -674,21 +730,57 @@ void ConvertApp::organizeSuppliedLods() {
         }
         LodGenerator::validate(source, "supplied LOD" + std::to_string(level));
         std::vector<size_t> assignments(source.size());
-        std::vector<size_t> counts(leaf_count, 0);
+        std::vector<size_t> counts = emitted_counts[level];
         for (size_t i = 0; i < source.size(); ++i) {
             const size_t leaf = level == finest_level ? finest_leaf[i] : assign_leaf(source[i].pos);
             assignments[i] = leaf;
-            ++counts[leaf];
         }
         std::vector<size_t> offsets(leaf_count + 1, 0);
         for (size_t leaf = 0; leaf < leaf_count; ++leaf) offsets[leaf + 1] = offsets[leaf] + counts[leaf];
         std::vector<size_t> cursors(offsets.begin(), offsets.end() - 1);
-        std::vector<Splat> reordered(source.size());
+        std::vector<Splat> reordered(offsets.back());
         std::vector<BBox> own_bounds(leaf_count);
+        // lodError is a rank placeholder here, not a geometric error: every
+        // supplied representation carries finest_level - level, and QuestSplat's
+        // pixel-error threshold is tuned against that scale. Synthesized
+        // representations must use the same units. Folding cluster_to_count()'s
+        // real world-space error in for synthesized leaves only put two
+        // incompatible scales in one field - metric errors in the hundreds
+        // alongside placeholders of 0..6 - which made the consumer treat exactly
+        // the synthesized regions as maximally urgent to refine. Emitting real
+        // errors is the right direction, but it has to be done for every rank at
+        // once, together with retuning the consumer's threshold.
+        std::vector<float> representation_errors(
+            leaf_count, static_cast<float>(finest_level - level));
+        size_t synthesized_rejected_merges = 0;
         for (size_t i = 0; i < source.size(); ++i) {
             const size_t leaf = assignments[i];
-            expand_support(own_bounds[leaf], source[i]);
             reordered[cursors[leaf]++] = std::move(source[i]);
+        }
+        for (size_t leaf = 0; leaf < leaf_count; ++leaf) {
+            if (supplied_counts[level][leaf] == 0) {
+                if (finer_offsets.size() != leaf_count + 1 ||
+                    finer_offsets[leaf + 1] <= finer_offsets[leaf]) {
+                    throw std::runtime_error("Cannot synthesize rank " + std::to_string(level) +
+                        " for spatial leaf " + std::to_string(leaf) +
+                        ": its immediate finer representation is unavailable");
+                }
+                std::vector<Splat> local_source;
+                local_source.insert(local_source.end(),
+                    finer_reordered.begin() + static_cast<ptrdiff_t>(finer_offsets[leaf]),
+                    finer_reordered.begin() + static_cast<ptrdiff_t>(finer_offsets[leaf + 1]));
+                LodLevel synthesized = LodGenerator::cluster_to_count(local_source, counts[leaf]);
+                synthesized_rejected_merges += synthesized.stats.rejected_merges;
+                for (Splat& splat : synthesized.splats) reordered[cursors[leaf]++] = std::move(splat);
+            }
+            if (cursors[leaf] != offsets[leaf + 1]) {
+                throw std::runtime_error("Internal supplied LOD count mismatch at rank " +
+                                         std::to_string(level) + ", spatial leaf " +
+                                         std::to_string(leaf));
+            }
+            for (size_t i = offsets[leaf]; i < offsets[leaf + 1]; ++i) {
+                expand_support(own_bounds[leaf], reordered[i]);
+            }
         }
         hierarchy_.splats_per_level[level] = reordered.size();
         hierarchy_.errors_per_level[level] = static_cast<float>(finest_level - level);
@@ -696,15 +788,14 @@ void ConvertApp::organizeSuppliedLods() {
         const fs::path complete_path = generated_lod_dir_ /
             ("supplied_lod_" + std::to_string(level) + ".ply");
         LodGenerator::write_binary_ply(complete_path, reordered, num_f_rest);
-        reordered_lods.push_back(complete_path);
+        reordered_lods[level] = complete_path;
 
         for (size_t leaf = 0; leaf < leaf_count; ++leaf) {
-            if (counts[leaf] == 0) continue;
             Lcc2HierarchyNodeInfo node;
             node.id = hierarchy_.nodes.size();
             node.level = level;
             node.count = counts[leaf];
-            node.error = hierarchy_.errors_per_level[level];
+            node.error = representation_errors[leaf];
             node.bounds = own_bounds[leaf];
             node_for[level][leaf] = node.id;
             hierarchy_.nodes.push_back(node);
@@ -713,12 +804,9 @@ void ConvertApp::organizeSuppliedLods() {
         size_t chunk = 0;
         size_t leaf = 0;
         while (leaf < leaf_count) {
-            while (leaf < leaf_count && counts[leaf] == 0) ++leaf;
-            if (leaf == leaf_count) break;
             std::vector<size_t> group;
             size_t group_count = 0;
             while (leaf < leaf_count) {
-                if (counts[leaf] == 0) { ++leaf; continue; }
                 if (counts[leaf] > lod_settings_.max_payload_splats) {
                     throw std::runtime_error("--max-payload-splats is smaller than supplied LOD" +
                                              std::to_string(level) + " spatial leaf " + std::to_string(leaf));
@@ -756,15 +844,23 @@ void ConvertApp::organizeSuppliedLods() {
             hierarchy_.payloads.push_back({ply_path, spz_path, level, payload_splats.size()});
         }
         log("  LOD" + std::to_string(level) + ": " + std::to_string(reordered.size()) +
-            " splats, " + std::to_string(chunk) + " SPZ chunks\n");
+            " splats, " + std::to_string(chunk) + " SPZ chunks; synthesized " +
+            std::to_string(synthesized_regions[level]) + " regions / " +
+            std::to_string(synthesized_splats[level]) + " splats (" +
+            std::to_string(synthesized_rejected_merges) +
+            " buckets kept a representative instead of merging)\n");
+        finer_reordered = std::move(reordered);
+        finer_offsets = std::move(offsets);
     }
 
     for (size_t leaf = 0; leaf < leaf_count; ++leaf) {
         std::vector<size_t> chain;
         for (size_t level = 0; level < level_count; ++level) {
-            if (node_for[level][leaf] != std::numeric_limits<size_t>::max()) {
-                chain.push_back(node_for[level][leaf]);
+            if (node_for[level][leaf] == std::numeric_limits<size_t>::max()) {
+                throw std::runtime_error("Incomplete supplied LOD ladder at spatial leaf " +
+                                         std::to_string(leaf) + ", rank " + std::to_string(level));
             }
+            chain.push_back(node_for[level][leaf]);
         }
         if (chain.empty()) continue;
         hierarchy_.roots.push_back(chain.front());
@@ -773,9 +869,28 @@ void ConvertApp::organizeSuppliedLods() {
         }
         for (size_t i = chain.size(); i-- > 1;) {
             hierarchy_.nodes[chain[i - 1]].bounds.expand(hierarchy_.nodes[chain[i]].bounds);
+            hierarchy_.nodes[chain[i - 1]].error = std::max(
+                hierarchy_.nodes[chain[i - 1]].error, hierarchy_.nodes[chain[i]].error);
         }
         hierarchy_.bounds.expand(hierarchy_.nodes[chain.front()].bounds);
     }
+    std::fill(hierarchy_.errors_per_level.begin(), hierarchy_.errors_per_level.end(), 0.0f);
+    for (const Lcc2HierarchyNodeInfo& node : hierarchy_.nodes) {
+        hierarchy_.errors_per_level[node.level] = std::max(
+            hierarchy_.errors_per_level[node.level], node.error);
+    }
+    const size_t mandatory_fallback = std::accumulate(
+        hierarchy_.roots.begin(), hierarchy_.roots.end(), size_t{0},
+        [&](size_t total, size_t root) { return total + hierarchy_.nodes[root].count; });
+    if (mandatory_fallback != hierarchy_.splats_per_level[0]) {
+        throw std::runtime_error("Supplied LOD fallback invariant failed: root fallback " +
+            std::to_string(mandatory_fallback) + " differs from rank-0 total " +
+            std::to_string(hierarchy_.splats_per_level[0]));
+    }
+    log("  complete roots per coarsest-available rank: rank 0=" + std::to_string(leaf_count));
+    for (size_t level = 1; level < level_count; ++level) log(" rank " + std::to_string(level) + "=0");
+    log("\n  declared rank-0 splats: " + std::to_string(hierarchy_.splats_per_level[0]) +
+        "\n  mandatory QuestSplat fallback: " + std::to_string(mandatory_fallback) + "\n");
     lod_files_ = std::move(reordered_lods);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     log("  hierarchy roots/nodes/payloads: " + std::to_string(hierarchy_.roots.size()) + "/" +

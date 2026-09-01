@@ -164,21 +164,20 @@ inline FILE* fopen(const fs::path& path, const char* mode) {
 inline fs::path resolve_executable(const fs::path& executable) {
     if (executable.empty()) return {};
 
-    auto candidate_exists = [](const fs::path& candidate) {
-        if (candidate.empty()) return false;
-        if (fs::exists(candidate)) return true;
+    auto resolve_candidate = [](const fs::path& candidate) -> fs::path {
+        if (candidate.empty()) return {};
+        if (fs::exists(candidate)) return candidate;
 #ifdef _WIN32
-        if (!candidate.extension().empty()) return false;
+        if (!candidate.extension().empty()) return {};
         for (const auto& suffix : { ".exe", ".cmd", ".bat" }) {
-            if (fs::exists(candidate.string() + suffix)) return true;
+            const fs::path with_suffix(candidate.string() + suffix);
+            if (fs::exists(with_suffix)) return with_suffix;
         }
 #endif
-        return false;
+        return {};
     };
 
-    if (candidate_exists(executable)) {
-        return executable;
-    }
+    if (const fs::path resolved = resolve_candidate(executable); !resolved.empty()) return resolved;
 
     const fs::path name = executable.filename();
     if (name.empty()) return executable;
@@ -195,9 +194,9 @@ inline fs::path resolve_executable(const fs::path& executable) {
 
     for (const auto& root : search_roots) {
         const fs::path local = root / "node_modules" / ".bin" / name;
-        if (candidate_exists(local)) return local;
+        if (const fs::path resolved = resolve_candidate(local); !resolved.empty()) return resolved;
         const fs::path direct = root / name;
-        if (candidate_exists(direct)) return direct;
+        if (const fs::path resolved = resolve_candidate(direct); !resolved.empty()) return resolved;
     }
 
     const char* path_env = std::getenv("PATH");
@@ -205,11 +204,17 @@ inline fs::path resolve_executable(const fs::path& executable) {
         std::string paths = path_env;
         size_t start = 0;
         while (start <= paths.size()) {
-            const size_t end = paths.find(':', start);
+            const size_t end = paths.find(
+#ifdef _WIN32
+                ';',
+#else
+                ':',
+#endif
+                start);
             const std::string item = paths.substr(start, end == std::string::npos ? std::string::npos : end - start);
             if (!item.empty()) {
                 const fs::path from_path = fs::path(item) / name;
-                if (candidate_exists(from_path)) return from_path;
+                if (const fs::path resolved = resolve_candidate(from_path); !resolved.empty()) return resolved;
             }
             if (end == std::string::npos) break;
             start = end + 1;

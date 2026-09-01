@@ -144,14 +144,22 @@ Levels are ordered coarsest-to-finest by their splat counts, so both
 finest supplied level builds one frozen adaptive spatial partition. Every
 Gaussian in every supplied level is then assigned by centre to that partition,
 reordered without changing its attributes, and encoded into bounded SPZ v4
-chunks. This path never clusters, decimates, merges, or retrains the supplied
-Gaussians.
+chunks. Supplied Gaussians are preserved unchanged wherever a level covers a
+region. If a region is absent at a level, the converter deterministically
+clusters that region's immediate finer representation using the supplied
+scene-wide adjacent-level ratio. This produces a non-empty local representation
+at every rank instead of forcing runtimes to load a finer fallback.
 
 `--max-leaf-splats` controls finest spatial partition density and
 `--max-payload-splats` controls chunk size. Complete node representations are
 never split. Conservative node bounds use three times the largest Gaussian
 principal scale and may overlap neighboring render bounds even though centre
 ownership is unique.
+
+Before output is committed, supplied hierarchies are required to contain a
+complete unary rank chain for every spatial root. Node totals must match
+`lodSplats`, payload ranges must cover every SPZ exactly, and the mandatory
+coarsest fallback must equal the declared coarsest count.
 
 LCC2 output currently includes 3DGS LOD files. An environment PLY is supported
 only when the LCC2 splat payloads are also PLY; it cannot be mixed with SPZ

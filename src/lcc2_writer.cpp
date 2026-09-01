@@ -203,6 +203,10 @@ void Lcc2Writer::write(const SpatialGrid& grid,
             hierarchy->roots.empty() || hierarchy->payloads.empty()) {
             throw std::runtime_error("Generated LCC2 hierarchy is incomplete");
         }
+        if (hierarchy->splats_per_level.size() != hierarchy->level_count ||
+            hierarchy->errors_per_level.size() != hierarchy->level_count) {
+            throw std::runtime_error("Generated LCC2 hierarchy rank metadata is incomplete");
+        }
         payloads.clear();
         payload_plys.clear();
         for (const Lcc2PayloadInfo& payload : hierarchy->payloads) {
@@ -232,10 +236,15 @@ void Lcc2Writer::write(const SpatialGrid& grid,
                 }
             }
         }
+        std::vector<size_t> represented_per_level(hierarchy->level_count, 0);
         for (const Lcc2HierarchyNodeInfo& node : hierarchy->nodes) {
             if (node.count == 0 || node.payload_index >= ranges.size()) {
                 throw std::runtime_error("Generated hierarchy contains an empty node or invalid payload reference");
             }
+            if (node.level >= hierarchy->level_count) {
+                throw std::runtime_error("Generated hierarchy contains an invalid rank");
+            }
+            represented_per_level[node.level] += node.count;
             ranges[node.payload_index].push_back({node.start, node.count});
             for (size_t i = 0; i < node.children.size(); ++i) {
                 for (size_t j = i + 1; j < node.children.size(); ++j) {
@@ -267,6 +276,44 @@ void Lcc2Writer::write(const SpatialGrid& grid,
                     node.error + tolerance < child.error) {
                     throw std::runtime_error("Generated hierarchy LOD errors are invalid or non-monotonic");
                 }
+            }
+        }
+        if (represented_per_level != hierarchy->splats_per_level) {
+            throw std::runtime_error("Generated hierarchy node totals do not match lodSplats rank totals");
+        }
+        if (hierarchy->require_complete_unary_rank_chains) {
+            size_t mandatory_fallback = 0;
+            std::vector<size_t> visits(hierarchy->nodes.size(), 0);
+            for (size_t root_id : hierarchy->roots) {
+                size_t node_id = root_id;
+                for (size_t level = 0; level < hierarchy->level_count; ++level) {
+                    if (node_id >= hierarchy->nodes.size()) {
+                        throw std::runtime_error("Supplied LOD ladder has an invalid node reference");
+                    }
+                    const Lcc2HierarchyNodeInfo& node = hierarchy->nodes[node_id];
+                    ++visits[node_id];
+                    if (node.level != level || node.count == 0) {
+                        throw std::runtime_error("Supplied LOD ladder is missing a non-empty representation at rank " +
+                                                 std::to_string(level));
+                    }
+                    if (level == 0) mandatory_fallback += node.count;
+                    if (level + 1 == hierarchy->level_count) {
+                        if (!node.children.empty()) {
+                            throw std::runtime_error("Supplied LOD ladder has children beyond its finest rank");
+                        }
+                    } else {
+                        if (node.children.size() != 1) {
+                            throw std::runtime_error("Supplied LOD ladder is not a complete unary rank chain");
+                        }
+                        node_id = node.children.front();
+                    }
+                }
+            }
+            if (std::any_of(visits.begin(), visits.end(), [](size_t count) { return count != 1; })) {
+                throw std::runtime_error("Supplied LOD hierarchy contains unreachable or multiply referenced nodes");
+            }
+            if (mandatory_fallback != hierarchy->splats_per_level[0]) {
+                throw std::runtime_error("Supplied LOD mandatory fallback does not equal rank-0 lodSplats");
             }
         }
         for (size_t payload_index = 0; payload_index < ranges.size(); ++payload_index) {

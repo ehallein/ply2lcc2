@@ -21,6 +21,17 @@ constexpr double kEpsilon = 1e-8;
 constexpr float kShC0 = 0.28209479177387814f;
 constexpr float kColourThreshold = 0.30f;
 constexpr float kSpatialThresholdFactor = 2.5f;
+// Largest bucket extent, as a multiple of the bucket members' own mean scale,
+// that cluster_to_count() is still willing to merge into a single Gaussian.
+// merge_cluster() folds member separation into the merged covariance, so
+// merging Gaussians that do not overlap yields a representative as wide as the
+// gap between them. Across a rank ladder each level would then compound the
+// previous level's inflation. A ladder that halves the count per rank only
+// needs about 1.41x linear growth per level to hold coverage constant, so this
+// leaves legitimate LOD growth untouched while refusing the pathological case.
+constexpr double kMergeExtentFactor = 4.0;
+// Floor for the above, so buckets of very small Gaussians can still merge.
+constexpr double kMinMergeExtent = 0.05;
 // Gaussian support used for conservative hierarchy bounds. Three standard
 // deviations contains 99.7% of a one-dimensional Gaussian. We use the maximum
 // principal scale on every world axis, which remains conservative under rotation.
@@ -725,6 +736,9 @@ Splat LodGenerator::merge_cluster(const std::vector<Splat>& splats,
         colour_sum.x += static_cast<float>(weight * colour.x);
         colour_sum.y += static_cast<float>(weight * colour.y);
         colour_sum.z += static_cast<float>(weight * colour.z);
+        for (size_t coefficient = 0; coefficient < 45; ++coefficient) {
+            result.f_rest[coefficient] += static_cast<float>(weight * splat.f_rest[coefficient]);
+        }
         alpha_product *= 1.0 - sigmoid(splat.opacity);
     }
     result.pos.x = static_cast<float>(result.pos.x / total_weight);
@@ -736,6 +750,9 @@ Splat LodGenerator::merge_cluster(const std::vector<Splat>& splats,
     result.f_dc[0] = (clamp(merged_colour.x, 0.0f, 1.0f) - 0.5f) / kShC0;
     result.f_dc[1] = (clamp(merged_colour.y, 0.0f, 1.0f) - 0.5f) / kShC0;
     result.f_dc[2] = (clamp(merged_colour.z, 0.0f, 1.0f) - 0.5f) / kShC0;
+    for (size_t coefficient = 0; coefficient < 45; ++coefficient) {
+        result.f_rest[coefficient] /= static_cast<float>(total_weight);
+    }
     result.opacity = logit(static_cast<float>(1.0 - alpha_product));
 
     Mat3 merged;
@@ -762,6 +779,71 @@ Splat LodGenerator::merge_cluster(const std::vector<Splat>& splats,
 
     if (error) *error = weightedPositionalError(splats, indices, result);
     return result;
+}
+
+LodLevel LodGenerator::cluster_to_count(const std::vector<Splat>& source,
+                                        size_t target_count) {
+    if (source.empty()) throw std::runtime_error("Cannot synthesize an LOD from an empty region");
+    if (target_count == 0 || target_count > source.size()) {
+        throw std::runtime_error("Synthesized LOD target must be between one and the local source count");
+    }
+    LodLevel level;
+    level.stats.input_count = source.size();
+    const auto ordered = morton_order(source);
+    level.splats.reserve(target_count);
+    double error_sum = 0.0;
+    level.stats.min_cluster_size = std::numeric_limits<size_t>::max();
+    for (size_t bucket = 0; bucket < target_count; ++bucket) {
+        const size_t begin = bucket * ordered.size() / target_count;
+        const size_t end = (bucket + 1) * ordered.size() / target_count;
+        std::vector<size_t> indices;
+        indices.reserve(end - begin);
+        for (size_t i = begin; i < end; ++i) indices.push_back(ordered[i].index);
+
+        // Morton order keeps a bucket's members adjacent along the curve, but in
+        // a sparse region "adjacent" can still be tens of metres apart. Merging
+        // those would fold the separation into the merged covariance and emit a
+        // single Gaussian spanning the gap, which is both wrong and ruinously
+        // expensive to rasterize. Where a bucket is too spread out to merge,
+        // keep its most important member instead - the same representative
+        // choice decimate() makes. Sparse regions therefore thin out rather than
+        // smearing, which is the correct coarse-LOD behaviour: there is
+        // genuinely less there to show.
+        BBox extent;
+        double scale_sum = 0.0;
+        for (size_t index : indices) {
+            extent.expand(source[index].pos);
+            scale_sum += max_scale(source[index]);
+        }
+        const double merge_extent = std::max(kMinMergeExtent,
+            kMergeExtentFactor * scale_sum / static_cast<double>(indices.size()));
+
+        float error = 0.0f;
+        if (indices.size() > 1 &&
+            point_distance(extent.min, extent.max) > merge_extent) {
+            size_t best = indices.front();
+            double best_importance = importance(source[best]);
+            for (size_t index : indices) {
+                const double score = importance(source[index]);
+                if (score > best_importance) { best = index; best_importance = score; }
+            }
+            level.splats.push_back(source[best]);
+            error = weightedPositionalError(source, indices, source[best]);
+            ++level.stats.rejected_merges;
+        } else {
+            level.splats.push_back(merge_cluster(source, indices, &error));
+        }
+        level.error = std::max(level.error, error);
+        error_sum += error;
+        level.stats.min_cluster_size = std::min(level.stats.min_cluster_size, indices.size());
+        level.stats.max_cluster_size = std::max(level.stats.max_cluster_size, indices.size());
+    }
+    level.stats.output_count = target_count;
+    level.stats.cluster_count = target_count;
+    level.stats.average_cluster_size = static_cast<double>(source.size()) / target_count;
+    level.stats.mean_covariance_error = error_sum / target_count;
+    level.stats.max_error = level.error;
+    return level;
 }
 
 void LodGenerator::validate(const std::vector<Splat>& splats, const std::string& label) {

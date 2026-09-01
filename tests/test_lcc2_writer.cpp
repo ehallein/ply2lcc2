@@ -96,6 +96,40 @@ void write_many_splats(const fs::path& path, size_t count) {
     LodGenerator::write_binary_ply(path, splats, 0);
 }
 
+void write_two_region_splats(const fs::path& path, size_t left_count, size_t right_count) {
+    std::vector<Splat> splats;
+    auto append = [&](float x, size_t count) {
+        for (size_t i = 0; i < count; ++i) {
+            Splat splat{};
+            splat.pos = Vec3f(x, 0.0f, 0.0f);
+            splat.scale = Vec3f(-2.0f, -2.0f, -2.0f);
+            splat.rot[0] = 1.0f;
+            splats.push_back(splat);
+        }
+    };
+    append(0.0f, left_count);
+    append(100.0f, right_count);
+    LodGenerator::write_binary_ply(path, splats, 0);
+}
+
+size_t count_text(const std::string& text, const std::string& needle) {
+    size_t count = 0;
+    for (size_t position = 0; (position = text.find(needle, position)) != std::string::npos;
+         position += needle.size()) ++count;
+    return count;
+}
+
+uint32_t read_spz_count(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    std::array<uint8_t, 13> header{};
+    file.read(reinterpret_cast<char*>(header.data()), header.size());
+    EXPECT_TRUE(file) << path;
+    return static_cast<uint32_t>(header[8]) |
+           (static_cast<uint32_t>(header[9]) << 8) |
+           (static_cast<uint32_t>(header[10]) << 16) |
+           (static_cast<uint32_t>(header[11]) << 24);
+}
+
 } // namespace
 
 TEST(Lcc2WriterTest, CreatesVersion003PackageWithReferencedPly) {
@@ -147,6 +181,7 @@ TEST(Lcc2WriterTest, CreatesVersion003PackageWithReferencedPly) {
     EXPECT_NE(read_text(notice_path).find("https://github.com/xgrids/LCC2Whitepaper"),
               std::string::npos);
 
+    exported = SplatBuffer{};
     fs::remove_all(base);
 }
 
@@ -226,6 +261,7 @@ TEST(Lcc2WriterTest, GeneratedLodUsesSpatialHierarchyAndErrorMetadata) {
     coarse_spz.read(reinterpret_cast<char*>(coarse_header.data()), coarse_header.size());
     ASSERT_TRUE(coarse_spz);
     EXPECT_EQ(coarse_header[12], 1);
+    coarse_spz.close();
     EXPECT_FALSE(fs::exists(output / ".generated_lod"));
     fs::remove_all(base);
 }
@@ -311,14 +347,74 @@ TEST(Lcc2WriterTest, SuppliedTrailingLodsAreInferredPreservedAndSpatiallyChunked
     ConvertApp(config).run();
 
     const std::string metadata = read_text(base / "output/meta.lcc2");
-    EXPECT_NE(metadata.find("\"lodSplats\": [24, 12, 6]"), std::string::npos);
-    EXPECT_NE(metadata.find("\"totalSplats\": 42"), std::string::npos);
+    EXPECT_NE(metadata.find("\"lodSplats\": [24, 12, 8]"), std::string::npos);
+    EXPECT_NE(metadata.find("\"totalSplats\": 44"), std::string::npos);
     EXPECT_NE(metadata.find("\"totalLevels\": 3"), std::string::npos);
     EXPECT_NE(metadata.find("\"splatType\": \".spz\""), std::string::npos);
     EXPECT_NE(metadata.find("supplied_lod_2_chunk_3.spz"), std::string::npos);
     EXPECT_NE(metadata.find("\"lodLevel\": 2"), std::string::npos);
     EXPECT_NE(metadata.find("\"lodLevel\": 0"), std::string::npos);
     EXPECT_FALSE(fs::exists(base / "output/.supplied_spatial_lod"));
+    fs::remove_all(base);
+}
+
+TEST(Lcc2WriterTest, SuppliedSparseCoverageSynthesizesCompleteDeterministicLadders) {
+    const fs::path base = fs::temp_directory_path() / "ply2lcc_lcc2_supplied_sparse_test";
+    fs::remove_all(base);
+    fs::create_directories(base);
+    // Only the finest input covers the distant region. Extent splitting makes
+    // that absence a separate spatial root at both coarser supplied ranks.
+    write_two_region_splats(base / "field_0.ply", 4, 0);
+    write_two_region_splats(base / "field_1.ply", 8, 0);
+    write_two_region_splats(base / "field_2.ply", 8, 8);
+
+    auto run = [&](const fs::path& output, std::string& logs) {
+        ConvertConfig config;
+        config.input_path = base / "field_0.ply";
+        config.output_dir = output;
+        config.output_format = OutputFormat::Lcc2;
+        config.include_env = false;
+        config.lod.max_leaf_splats = 32;
+        config.lod.max_node_diagonal = 10.0f;
+        config.lod.min_split_splats = 2;
+        config.lod.max_payload_splats = 8;
+        config.splat_transform_path = PLY2LCC_FAKE_SPLAT_TRANSFORM;
+        ConvertApp app(config);
+        app.setLogCallback([&](const std::string& message) { logs += message; });
+        app.run();
+    };
+    std::string first_logs, second_logs;
+    run(base / "first", first_logs);
+    run(base / "second", second_logs);
+
+    const std::string first = read_text(base / "first/meta.lcc2");
+    const std::string second = read_text(base / "second/meta.lcc2");
+    EXPECT_EQ(first, second);
+    EXPECT_NE(first.find("\"lodSplats\": [16, 12, 6]"), std::string::npos);
+    EXPECT_NE(first.find("\"totalSplats\": 34"), std::string::npos);
+    EXPECT_EQ(count_text(first, "\"lodLevel\": 0"), 2u);
+    EXPECT_EQ(count_text(first, "\"lodLevel\": 1"), 2u);
+    EXPECT_EQ(count_text(first, "\"lodLevel\": 2"), 2u);
+    EXPECT_EQ(count_text(first, "\"count\": 0"), 0u);
+    EXPECT_EQ(count_text(first, "\"childNum\": 1"), 4u);
+    EXPECT_NE(first_logs.find("supplied roots per coarsest-available rank: rank 0=1 rank 1=0 rank 2=1"),
+              std::string::npos);
+    EXPECT_NE(first_logs.find("LOD0: 6 splats"), std::string::npos);
+    EXPECT_NE(first_logs.find("synthesized 1 regions / 2 splats"), std::string::npos);
+    EXPECT_NE(first_logs.find("mandatory QuestSplat fallback: 6"), std::string::npos);
+
+    std::array<size_t, 3> payload_totals{};
+    for (const auto& entry : fs::directory_iterator(base / "first/data/3dgs")) {
+        const std::string name = entry.path().filename().u8string();
+        for (size_t level = 0; level < payload_totals.size(); ++level) {
+            if (name.rfind("supplied_lod_" + std::to_string(level) + "_chunk_", 0) == 0) {
+                payload_totals[level] += read_spz_count(entry.path());
+            }
+        }
+    }
+    EXPECT_EQ(payload_totals[0], 6u);
+    EXPECT_EQ(payload_totals[1], 12u);
+    EXPECT_EQ(payload_totals[2], 16u);
     fs::remove_all(base);
 }
 

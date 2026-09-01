@@ -15,8 +15,9 @@ Recognize a trailing numeric LOD suffix, including names such as `scene_lod0`,
 and infer the complete contiguous level set from sibling filenames. For
 multi-level LCC2 input, order supplied levels by splat count from coarsest to
 finest and build one adaptive kd partition from the finest supplied level.
-This is a preservation path: it does not invoke clustering, decimation, or
-training and it validates that every source splat appears exactly once.
+This is a preservation-first path: supplied records remain unchanged, while a
+missing region/rank representation is synthesized locally from the immediate
+finer representation. It does not retrain the supplied levels.
 
 ## Data flow
 
@@ -25,17 +26,23 @@ training and it validates that every source splat appears exactly once.
 3. Build and freeze an adaptive spatial partition from the finest set.
 4. Assign every Gaussian centre at every level through the same split planes.
 5. Reorder complete Gaussian records by spatial leaf.
-6. Encode bounded groups of complete leaf representations as SPZ v4.
-7. Write LCC2 nodes whose file index and start/count reference those chunks.
+6. Fill missing leaf/rank pairs by deterministic moment-matched clustering,
+   using the supplied scene-wide adjacent-rank count ratio and at least one
+   representative per leaf.
+7. Encode bounded groups of complete leaf representations as SPZ v4.
+8. Write LCC2 nodes whose file index and start/count reference those chunks.
 
 ## Hierarchy strategy
 
 The initial partition is a deterministic longest-axis kd tree. It stops at
 `--max-leaf-splats`, or later when the optional extent limit is satisfied.
 Every spatial leaf has an independent chain of the supplied representations,
-coarsest to finest. A missing representation is omitted and the chain links to
-the next available supplied level. Bounds use three times the largest Gaussian
-principal scale and parents are expanded to include their descendants.
+coarsest to finest. Every chain contains a non-empty node at every declared
+rank; missing supplied coverage is synthesized only from the same leaf's
+immediate finer representation. Bounds use three times the largest Gaussian
+principal scale and parents are expanded to include their descendants. Output
+is rejected unless every chain is complete and the coarsest root sum equals the
+declared coarsest `lodSplats` count.
 
 ## SPZ chunking strategy
 

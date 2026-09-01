@@ -91,6 +91,10 @@ public:
     static Splat merge_cluster(const std::vector<Splat>& splats,
                                const std::vector<size_t>& indices,
                                float* error = nullptr);
+    // Deterministically merges a local Gaussian set into exactly target_count
+    // representatives. This is used to fill holes in supplied spatial LODs.
+    static LodLevel cluster_to_count(const std::vector<Splat>& source,
+                                     size_t target_count);
     static void validate(const std::vector<Splat>& splats, const std::string& label);
     static void write_binary_ply(const std::filesystem::path& path,
                                  const std::vector<Splat>& splats,

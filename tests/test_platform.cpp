@@ -76,6 +76,7 @@ TEST_F(PlatformTest, OfstreamOpen) {
     std::string content;
     std::getline(in, content);
     EXPECT_EQ(content, "Test output");
+    in.close();
     fs::remove(out_file);
 }
 
